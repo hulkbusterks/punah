@@ -1,0 +1,11 @@
+[package]
+name = "punah-events"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+punah-types = { path = "../punah-types" }
+
+[lints]
+workspace = true

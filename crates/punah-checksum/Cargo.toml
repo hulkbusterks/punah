@@ -1,0 +1,11 @@
+[package]
+name = "punah-checksum"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+
+[lints]
+workspace = true

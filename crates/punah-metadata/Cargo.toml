@@ -1,0 +1,11 @@
+[package]
+name = "punah-metadata"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+punah-checksum = { path = "../punah-checksum" }
+
+[lints]
+workspace = true

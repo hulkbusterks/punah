@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/punah-bench",
+    "crates/punah-compaction",
+    "crates/punah-config",
+    "crates/punah-device",
+    "crates/punah-engine",
+    "crates/punah-events",
+    "crates/punah-identity",
+    "crates/punah-network",
+    "crates/punah-operation",
+    "crates/punah-metadata",
+    "crates/punah-protocol",
+    "crates/punah-checksum",
+    "crates/punah-cluster",
+    "crates/punah-record",
+    "crates/punah-runtime",
+    "crates/punah-server",
+    "crates/punah-service",
+    "crates/punah-sim",
+    "crates/punah-store",
+    "crates/punah-types",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[workspace.dependencies]
+blake3 = "1.8.2"
+crc32c = "0.6.8"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

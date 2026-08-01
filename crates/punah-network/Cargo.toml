@@ -1,0 +1,11 @@
+[package]
+name = "punah-network"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+punah-protocol = { path = "../punah-protocol" }
+
+[lints]
+workspace = true

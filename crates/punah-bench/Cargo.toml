@@ -1,0 +1,17 @@
+[package]
+name = "punah-bench"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+punah-compaction = { path = "../punah-compaction" }
+punah-metadata = { path = "../punah-metadata" }
+punah-network = { path = "../punah-network" }
+punah-protocol = { path = "../punah-protocol" }
+punah-runtime = { path = "../punah-runtime" }
+punah-store = { path = "../punah-store" }
+punah-types = { path = "../punah-types" }
+
+[lints]
+workspace = true

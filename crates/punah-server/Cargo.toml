@@ -1,0 +1,19 @@
+[package]
+name = "punah-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+punah-config = { path = "../punah-config" }
+punah-network = { path = "../punah-network" }
+punah-protocol = { path = "../punah-protocol" }
+punah-runtime = { path = "../punah-runtime" }
+punah-service = { path = "../punah-service" }
+punah-types = { path = "../punah-types" }
+
+[dev-dependencies]
+punah-identity = { path = "../punah-identity" }
+
+[lints]
+workspace = true

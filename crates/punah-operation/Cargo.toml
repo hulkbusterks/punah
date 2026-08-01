@@ -1,0 +1,12 @@
+[package]
+name = "punah-operation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+punah-types = { path = "../punah-types" }
+
+[lints]
+workspace = true

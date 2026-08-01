@@ -1,0 +1,12 @@
+[package]
+name = "punah-compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+punah-metadata = { path = "../punah-metadata" }
+punah-types = { path = "../punah-types" }
+
+[lints]
+workspace = true

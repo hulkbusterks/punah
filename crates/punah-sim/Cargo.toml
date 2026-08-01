@@ -1,0 +1,13 @@
+[package]
+name = "punah-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+punah-engine = { path = "../punah-engine" }
+punah-cluster = { path = "../punah-cluster" }
+punah-types = { path = "../punah-types" }
+
+[lints]
+workspace = true

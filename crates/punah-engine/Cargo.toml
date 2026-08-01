@@ -1,0 +1,14 @@
+[package]
+name = "punah-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+punah-device = { path = "../punah-device" }
+punah-identity = { path = "../punah-identity" }
+punah-record = { path = "../punah-record" }
+punah-types = { path = "../punah-types" }
+
+[lints]
+workspace = true

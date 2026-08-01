@@ -1,0 +1,11 @@
+[package]
+name = "punah-device"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+memmap2 = "0.9"

@@ -1,0 +1,9 @@
+[package]
+name = "punah-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Validated programmatic configuration for Punah"
+
+[lints]
+workspace = true

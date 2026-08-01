@@ -1,0 +1,11 @@
+[package]
+name = "punah-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+punah-identity = { path = "../punah-identity" }
+
+[lints]
+workspace = true
