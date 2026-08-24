@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+punah-compaction = { path = "../punah-compaction" }
 punah-identity = { path = "../punah-identity" }
 punah-engine = { path = "../punah-engine" }
 punah-store = { path = "../punah-store" }

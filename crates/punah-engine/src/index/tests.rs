@@ -135,3 +135,52 @@ fn recovered_tombstone_prevents_older_copy_resurrection() {
     assert_eq!(report.tombstones_applied, 1);
     assert_eq!(report.artifacts_applied, 0);
 }
+
+#[test]
+fn recovery_stops_at_first_zero_header_without_scanning_capacity_tail() {
+    let encoded = punah_record::encode(&record(RecordType::Artifact, 1, b"payload")).unwrap();
+    let committed_boundary = encoded.len();
+    let mut segment = encoded;
+    segment.resize(committed_boundary + punah_record::RECORD_HEADER_LEN, 0);
+    segment.extend_from_slice(&[1; punah_record::RECORD_HEADER_LEN]);
+
+    let (index, report) = recover_segment(&segment, SegmentId(1), 0).unwrap();
+
+    assert_eq!(report.records_scanned, 1);
+    assert_eq!(report.committed_boundary, committed_boundary as u64);
+    assert_eq!(index.len(), 1);
+}
+
+#[test]
+fn recovery_rejects_nonzero_corrupt_header_at_next_record() {
+    let encoded = punah_record::encode(&record(RecordType::Artifact, 1, b"payload")).unwrap();
+    let corrupt_offset = encoded.len();
+    let mut segment = encoded;
+    segment.extend_from_slice(&[1; punah_record::RECORD_HEADER_LEN]);
+
+    assert!(matches!(
+        recover_segment(&segment, SegmentId(1), 0),
+        Err(RecoveryError::Corrupt {
+            offset,
+            source: DecodeError::BadMagic,
+        }) if offset == corrupt_offset as u64
+    ));
+}
+
+#[test]
+fn recovered_location_tracks_logical_payload_length() {
+    let payload = b"payload bytes";
+    let encoded = punah_record::encode(&record(RecordType::Artifact, 1, payload)).unwrap();
+
+    let (index, _) = recover_segment(&encoded, SegmentId(3), 2).unwrap();
+    let namespace = Namespace::new("test").unwrap();
+    let entry = index
+        .get(&namespace, &[1; 32], SystemTime::UNIX_EPOCH)
+        .unwrap();
+
+    assert_eq!(
+        entry.location.logical_len,
+        u32::try_from(payload.len()).unwrap()
+    );
+    assert_eq!(entry.location.stored_len as usize, encoded.len());
+}

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/punah-admin",
     "crates/punah-bench",
     "crates/punah-compaction",
     "crates/punah-config",

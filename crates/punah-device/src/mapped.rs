@@ -1,8 +1,8 @@
-//! Bounds-checked, read-only views of segment files.
+//! Bounds-checked, owned reads from mapped segment files.
 //!
 //! This is the only module in `punah-device` allowed to establish an OS memory
-//! mapping. Callers receive slices whose lifetime is tied to the mapping and
-//! cannot construct pointers or access bytes outside the mapped file.
+//! mapping. It never creates or returns a Rust reference into file-backed
+//! memory, because the active file may change through its writer handle.
 
 #![allow(unsafe_code)]
 
@@ -10,11 +10,11 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{MmapOptions, MmapRaw};
 
 /// A read-only mapping whose address remains valid for its complete lifetime.
 pub struct MappedSegment {
-    mapping: Mmap,
+    mapping: MmapRaw,
 }
 
 /// A location cannot be represented by or contained within a mapping.
@@ -33,30 +33,60 @@ impl MappedSegment {
     /// when it is empty.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(path)?;
-        // SAFETY: the returned mapping owns its virtual-memory lifetime and is
-        // never exposed mutably. Punah sizes segment files before mapping and
-        // never truncates an installed segment. Writers use a separate file
-        // handle and publish locations only after their commit marker is
-        // complete. External file mutation remains outside this API's contract
-        // and is detected by the record checksums at the decoding boundary.
-        let mapping = unsafe { MmapOptions::new().map(&file)? };
+        // MmapRaw deliberately does not implement Deref and therefore cannot
+        // create a long-lived Rust reference while the active file changes.
+        let mapping = MmapOptions::new().map_raw_read_only(&file)?;
         Ok(Self { mapping })
     }
 
-    /// Returns a checked range tied to this mapping's lifetime.
+    /// Copies a checked mapped range into a new owned buffer.
     ///
     /// # Errors
     ///
     /// Rejects locations that overflow `usize` or extend beyond the file.
-    pub fn read(&self, offset: u64, length: u32) -> Result<&[u8], MappedReadError> {
-        let start = usize::try_from(offset).map_err(|_| MappedReadError::OffsetOverflow)?;
+    pub fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, MappedReadError> {
         let length = usize::try_from(length).map_err(|_| MappedReadError::OffsetOverflow)?;
+        self.checked_start(offset, length)?;
+        let mut output = vec![0; length];
+        self.read_into(offset, &mut output)?;
+        Ok(output)
+    }
+
+    /// Copies a checked mapped range into caller-owned memory.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an offset that overflows or places any output byte beyond the
+    /// original mapped length.
+    pub fn read_into(&self, offset: u64, output: &mut [u8]) -> Result<(), MappedReadError> {
+        let start = self.checked_start(offset, output.len())?;
+        // SAFETY: the source range is checked against the mapping established
+        // at construction, and `output` is valid for exactly `output.len()`
+        // writable bytes. The mapping pointer is never exposed, so safe callers
+        // cannot make the regions overlap. Crucially, this performs a raw copy
+        // and never constructs `&[u8]` over file-backed memory that an active
+        // writer may change. A racing write can produce a torn owned snapshot,
+        // which record checksums reject; Punah itself serializes shard reads and
+        // writes. Installed segment files are never truncated.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mapping.as_ptr().add(start),
+                output.as_mut_ptr(),
+                output.len(),
+            );
+        }
+        Ok(())
+    }
+
+    fn checked_start(&self, offset: u64, length: usize) -> Result<usize, MappedReadError> {
+        let start = usize::try_from(offset).map_err(|_| MappedReadError::OffsetOverflow)?;
         let end = start
             .checked_add(length)
             .ok_or(MappedReadError::OffsetOverflow)?;
-        self.mapping
-            .get(start..end)
-            .ok_or(MappedReadError::OutOfBounds)
+        if end > self.mapping.len() {
+            return Err(MappedReadError::OutOfBounds);
+        }
+        Ok(start)
     }
 
     #[must_use]
@@ -66,7 +96,7 @@ impl MappedSegment {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.mapping.is_empty()
+        self.mapping.len() == 0
     }
 }
 
@@ -91,7 +121,11 @@ mod tests {
         file.seek(SeekFrom::Start(7)).expect("seek");
         file.write_all(b"punah").expect("write");
         file.sync_data().expect("sync");
-        assert_eq!(mapped.read(7, 5), Ok(&b"punah"[..]));
+        assert_eq!(mapped.read(7, 5), Ok(b"punah".to_vec()));
+        assert!(matches!(
+            mapped.read(0, u64::MAX),
+            Err(MappedReadError::OutOfBounds | MappedReadError::OffsetOverflow)
+        ));
         assert_eq!(mapped.read(31, 2), Err(MappedReadError::OutOfBounds));
         assert_eq!(
             mapped.read(u64::MAX, 2),

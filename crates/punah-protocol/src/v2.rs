@@ -140,6 +140,39 @@ pub fn encode(frame: FrameRef<'_>) -> Result<Vec<u8>, EncodeError> {
     Ok(output)
 }
 
+/// Encode and validate the fixed header for scatter/gather output.
+///
+/// The checksum covers the header prefix, key, and value, so writing those
+/// three buffers separately is wire-identical to [`encode`].
+///
+/// # Errors
+/// Returns an error if either payload field exceeds its protocol bound.
+pub fn encode_header(frame: FrameRef<'_>) -> Result<[u8; HEADER_LEN], EncodeError> {
+    checked_len(frame)?;
+    let key_len = u32::try_from(frame.key.len()).map_err(|_| EncodeError::KeyTooLarge {
+        length: frame.key.len(),
+        maximum: MAX_KEY_LEN,
+    })?;
+    let value_len = u32::try_from(frame.value.len()).map_err(|_| EncodeError::ValueTooLarge {
+        length: frame.value.len(),
+        maximum: MAX_VALUE_LEN,
+    })?;
+    let mut header = [0_u8; HEADER_LEN];
+    header[0] = VERSION;
+    header[1] = frame.opcode as u8;
+    header[2] = frame.status as u8;
+    header[3] = frame.flags;
+    // 4..6 are reserved and remain zero.
+    header[6..8].copy_from_slice(&HEADER_LEN_WIRE.to_be_bytes());
+    header[8..16].copy_from_slice(&frame.request_id.to_be_bytes());
+    header[16..20].copy_from_slice(&key_len.to_be_bytes());
+    header[20..24].copy_from_slice(&value_len.to_be_bytes());
+    header[24..28].copy_from_slice(&frame.ttl_seconds.to_be_bytes());
+    let checksum = checksum_parts(&[&header[..28], frame.key, frame.value]);
+    header[28..32].copy_from_slice(&checksum.to_be_bytes());
+    Ok(header)
+}
+
 /// Encode one frame into `output`, preserving bytes after the encoded frame.
 ///
 /// # Errors
@@ -153,30 +186,11 @@ pub fn encode_into(frame: FrameRef<'_>, output: &mut [u8]) -> Result<usize, Enco
             available: output.len(),
         });
     }
-    let key_len = u32::try_from(frame.key.len()).map_err(|_| EncodeError::KeyTooLarge {
-        length: frame.key.len(),
-        maximum: MAX_KEY_LEN,
-    })?;
-    let value_len = u32::try_from(frame.value.len()).map_err(|_| EncodeError::ValueTooLarge {
-        length: frame.value.len(),
-        maximum: MAX_VALUE_LEN,
-    })?;
+    let header = encode_header(frame)?;
     let bytes = &mut output[..length];
-    bytes.fill(0);
-    bytes[0] = VERSION;
-    bytes[1] = frame.opcode as u8;
-    bytes[2] = frame.status as u8;
-    bytes[3] = frame.flags;
-    // 4..6 are reserved and must remain zero.
-    bytes[6..8].copy_from_slice(&HEADER_LEN_WIRE.to_be_bytes());
-    bytes[8..16].copy_from_slice(&frame.request_id.to_be_bytes());
-    bytes[16..20].copy_from_slice(&key_len.to_be_bytes());
-    bytes[20..24].copy_from_slice(&value_len.to_be_bytes());
-    bytes[24..28].copy_from_slice(&frame.ttl_seconds.to_be_bytes());
+    bytes[..HEADER_LEN].copy_from_slice(&header);
     bytes[HEADER_LEN..HEADER_LEN + frame.key.len()].copy_from_slice(frame.key);
     bytes[HEADER_LEN + frame.key.len()..].copy_from_slice(frame.value);
-    let checksum = checksum_parts(&[&bytes[..28], frame.key, frame.value]);
-    bytes[28..32].copy_from_slice(&checksum.to_be_bytes());
     Ok(length)
 }
 
@@ -420,6 +434,16 @@ mod tests {
         assert_eq!(encode_into(frame.as_ref(), &mut output).unwrap(), expected);
         assert_eq!(&output[expected..], &[0xcc; 5]);
         assert_eq!(decode(&output).unwrap().1, expected);
+    }
+
+    #[test]
+    fn header_encoding_matches_contiguous_encoding() {
+        let frame = sample();
+        let encoded = encode(frame.as_ref()).unwrap();
+        assert_eq!(
+            encode_header(frame.as_ref()).unwrap(),
+            encoded[..HEADER_LEN]
+        );
     }
 
     #[test]

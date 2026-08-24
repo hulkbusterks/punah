@@ -3,18 +3,21 @@
 The durable format is versioned before the first implementation. Integer byte
 order is little-endian unless a later version explicitly states otherwise.
 
-## Segment
+## Segment container
 
-A segment begins with redundant superblock information containing at least:
+The portable version-1 segment is a preallocated, headerless record region.
+Segment identity, generation, start offset, authoritative logical length, and
+sealed sequence live in the crash-safe manifest rather than in an unimplemented
+per-file superblock. Records are self-describing, so an explicitly selected
+legacy-import path can discover a contiguous committed prefix when metadata is
+pristine.
 
-- magic and format version
-- segment identifier and generation
-- device/block alignment
-- logical committed boundary
-- creation sequence and checksum
-
-The physical file or namespace capacity is not the logical write position.
-Preallocation must never make an empty segment appear full during recovery.
+Physical capacity is never the logical write position. A sealed manifest entry
+is scanned strictly through `start_offset + logical_length`. The last active
+entry validates its published prefix, whose length may lag ordinary appends,
+then scans a contiguous committed suffix. The first all-zero 128-byte header,
+an incomplete record, or an uncommitted record ends that active suffix. Nonzero
+corruption before an accepted boundary is an error.
 
 ## Record version 1
 
@@ -43,9 +46,10 @@ The initial record uses a 128-byte fixed header followed by variable data:
 
 Variable data is namespace bytes, original key bytes, dependency hashes,
 payload bytes, then zero padding to the configured alignment. The original key
-is retained because a routing hash is not an equality proof. Version 1 currently uses eight-byte
-alignment in the portable engine; device backends may require a larger segment
-write alignment without changing logical record parsing.
+is retained because a routing hash is not an equality proof. Version 1 currently
+uses eight-byte alignment in the portable engine. Its four-byte commit marker is
+not suitable for every raw device; a direct SPDK backend may require a new
+aligned commit representation while retaining the same logical fields.
 
 Header CRC covers bytes `0..112`. Record CRC covers the fixed header except the
 record-CRC and commit fields, plus the complete variable region and padding.
@@ -71,8 +75,35 @@ tombstones carry a zero content identity and name their target by exact key.
 6. Acknowledge the caller.
 
 Recovery accepts only structurally complete, committed records with valid
-checksums. It rebuilds the index in sequence-number order. Newer artifacts and
-tombstones supersede older locations.
+checksums. It replays manifest order while sequence fencing ensures newer
+artifacts and tombstones supersede stale locations.
+
+## Aligned extent/footer version 2 primitive
+
+The record crate now contains a direct-device codec primitive without switching
+the portable segment format. An aligned extent has two separately submitted
+objects:
+
+1. an alignment-sized/padded body beginning with `PUNAXB02`, containing dense
+   committed v1 logical records;
+2. one alignment-sized footer beginning with `PUNAXC02`, repeating the body
+   length, used length, record count, sequence endpoints, and body CRC32-C.
+
+Alignment must be a power of two from 512 bytes through 64 KiB. Both headers
+have independent CRC32-C values, body/footer fields must match exactly, and all
+padding is canonical zero. The intended direct-device sequence is `N aligned
+body writes -> wait -> Flush -> one aligned footer write -> wait -> Flush ->
+ordered publication`. Missing, torn, mismatched, or corrupt footers authorize no
+records. A valid final footer may still become durable while its acknowledgement
+is lost, matching the existing ambiguous-final-Flush rule.
+
+This packs small records inside an aligned body rather than spending a direct-
+I/O block per key, and removes record v1's four-byte in-place marker write from
+the direct path. It does not make a cohort a multi-record transaction: after
+recovery validates the extent, records are published individually in sequence.
+The current `FileDevice` Store still writes record v1. Activating extent v2
+requires a segment-version discriminator, a device capability contract for
+alignment/Flush/FUA, recovery integration, and Linux direct-I/O benchmarks.
 
 ## Compaction correctness
 

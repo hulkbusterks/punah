@@ -6,9 +6,12 @@ version.workspace = true
 
 [dependencies]
 punah-compaction = { path = "../punah-compaction" }
+punah-device = { path = "../punah-device" }
+punah-engine = { path = "../punah-engine" }
 punah-metadata = { path = "../punah-metadata" }
 punah-network = { path = "../punah-network" }
 punah-protocol = { path = "../punah-protocol" }
+punah-record = { path = "../punah-record" }
 punah-runtime = { path = "../punah-runtime" }
 punah-store = { path = "../punah-store" }
 punah-types = { path = "../punah-types" }

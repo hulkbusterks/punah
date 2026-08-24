@@ -19,6 +19,9 @@ pub enum PublicationError {
     Io(io::Error),
     Encode(EncodeError),
     Decode(DecodeError),
+    /// Both complete root slots are in the canonical never-published state.
+    Uninitialized,
+    /// Root bytes exist, but neither root and all of its references validate.
     NoRecoverableRoot,
     InvalidPointer,
     GenerationMismatch,
@@ -87,6 +90,17 @@ impl FileMetadataIo {
         }
         Ok(Self { file })
     }
+
+    /// Opens an existing metadata file read-only without extending or otherwise
+    /// mutating it. Recovery/inspection works; publication through the returned
+    /// handle fails with the operating system's read-only-file error.
+    ///
+    /// # Errors
+    /// Returns an I/O error when the existing file cannot be opened.
+    pub fn open_existing(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        Ok(Self { file })
+    }
 }
 
 impl MetadataIo for FileMetadataIo {
@@ -131,18 +145,24 @@ impl<I: MetadataIo> MetadataPublisher<I> {
     /// Recovers the newest root whose complete referenced objects validate.
     ///
     /// # Errors
-    /// Returns `NoRecoverableRoot` when neither root and its references validate.
+    /// Returns `Uninitialized` only when both complete root slots are zero, and
+    /// `NoRecoverableRoot` when nonzero metadata exists but neither root and its
+    /// references validate.
     pub fn recover(&mut self) -> Result<RecoveredRoot, PublicationError> {
         let mut candidates = Vec::new();
+        let mut all_slots_zero = true;
         for slot in 0..2 {
             let mut bytes = [0; SUPERBLOCK_SIZE];
             match self.io.read_exact_at(slot_offset(slot), &mut bytes) {
                 Ok(()) => {
+                    all_slots_zero &= bytes.iter().all(|byte| *byte == 0);
                     if let Ok(superblock) = decode_superblock(&bytes) {
                         candidates.push((slot, superblock));
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    all_slots_zero = false;
+                }
                 Err(error) => return Err(PublicationError::Io(error)),
             }
         }
@@ -164,7 +184,11 @@ impl<I: MetadataIo> MetadataPublisher<I> {
                 Err(_) => {}
             }
         }
-        Err(PublicationError::NoRecoverableRoot)
+        if all_slots_zero {
+            Err(PublicationError::Uninitialized)
+        } else {
+            Err(PublicationError::NoRecoverableRoot)
+        }
     }
 
     /// Appends and commits an immutable journal object without publishing a root.
@@ -190,7 +214,7 @@ impl<I: MetadataIo> MetadataPublisher<I> {
     ) -> Result<RecoveredRoot, PublicationError> {
         let previous = match self.recover() {
             Ok(root) => Some(root),
-            Err(PublicationError::NoRecoverableRoot) => None,
+            Err(PublicationError::Uninitialized) => None,
             Err(error) => return Err(error),
         };
         if let Some(root) = &previous {
@@ -261,7 +285,11 @@ impl<I: MetadataIo> MetadataPublisher<I> {
         let journal_tail = if is_zero_pointer(superblock.journal_tail) {
             None
         } else {
-            Some(self.read_journal(superblock.journal_tail)?)
+            let entry = self.read_journal(superblock.journal_tail)?;
+            if entry.generation != superblock.generation {
+                return Err(PublicationError::GenerationMismatch);
+            }
+            Some(entry)
         };
         Ok(RecoveredRoot {
             slot,
@@ -400,6 +428,52 @@ mod tests {
     }
 
     #[test]
+    fn blank_roots_are_distinct_from_corrupt_roots() {
+        let mut blank = MetadataPublisher::new(MemoryIo::new());
+        assert!(matches!(
+            blank.recover(),
+            Err(PublicationError::Uninitialized)
+        ));
+
+        let mut io = MemoryIo::new();
+        io.volatile[0] = 1;
+        io.durable[0] = 1;
+        let mut corrupt = MetadataPublisher::new(io);
+        assert!(matches!(
+            corrupt.recover(),
+            Err(PublicationError::NoRecoverableRoot)
+        ));
+    }
+
+    #[test]
+    fn corrupt_roots_cannot_be_overwritten_as_a_fresh_publication() {
+        let mut publisher = MetadataPublisher::new(MemoryIo::new());
+        publisher
+            .publish_checkpoint(&checkpoint(1), None)
+            .expect("one");
+        publisher
+            .publish_checkpoint(&checkpoint(2), None)
+            .expect("two");
+        let mut io = publisher.into_inner();
+        for slot in 0..2 {
+            let offset = slot * SUPERBLOCK_SIZE;
+            io.volatile[offset] ^= 1;
+            io.durable[offset] ^= 1;
+        }
+        let before = io.volatile.clone();
+        let mut corrupt = MetadataPublisher::new(io);
+        assert!(matches!(
+            corrupt.recover(),
+            Err(PublicationError::NoRecoverableRoot)
+        ));
+        assert!(matches!(
+            corrupt.publish_checkpoint(&checkpoint(3), None),
+            Err(PublicationError::NoRecoverableRoot)
+        ));
+        assert_eq!(corrupt.into_inner().volatile, before);
+    }
+
+    #[test]
     fn every_publication_boundary_recovers_old_or_new_root() {
         let mut initial = MetadataPublisher::new(MemoryIo::new());
         initial
@@ -440,6 +514,26 @@ mod tests {
                 .generation,
             1
         );
+    }
+
+    #[test]
+    fn root_rejects_a_journal_tail_from_another_generation() {
+        let mut publisher = MetadataPublisher::new(MemoryIo::new());
+        let tail = publisher
+            .append_journal(&JournalEntry {
+                generation: 2,
+                operation: crate::JournalOperation::Retire {
+                    segments: vec![crate::SegmentRef {
+                        id: 9,
+                        generation: 1,
+                    }],
+                },
+            })
+            .expect("journal");
+        assert!(matches!(
+            publisher.publish_checkpoint(&checkpoint(1), Some(tail)),
+            Err(PublicationError::GenerationMismatch)
+        ));
     }
 
     #[test]

@@ -1,0 +1,60 @@
+name: Dynamic analysis
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dynamic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    name: Miri (safe codecs and state machines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned nightly with Miri
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component miri
+      - name: Prepare Miri sysroot
+        run: cargo +nightly-2026-08-20 miri setup
+      - name: Run pure safe crates under Miri
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo +nightly-2026-08-20 miri test --locked -p punah-record -p punah-metadata -p punah-compaction -p punah-operation -p punah-types
+
+  address-sanitizer:
+    name: Address sanitizer (storage path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned nightly
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal
+      - name: Run device, engine, and Store tests with ASan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+        run: cargo +nightly-2026-08-20 test --target x86_64-unknown-linux-gnu --locked -p punah-device -p punah-engine -p punah-store
+
+  coverage:
+    name: LLVM coverage summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Rust toolchain with coverage tools
+        run: rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview
+      - name: Install pinned cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.6.21 --locked
+      - name: Report workspace coverage
+        run: cargo llvm-cov --workspace --all-features --summary-only --locked

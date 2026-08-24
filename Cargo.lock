@@ -15,6 +15,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "bitflags"
+version = "2.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+
+[[package]]
 name = "blake3"
 version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -75,6 +81,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -90,13 +107,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "punah-admin"
+version = "0.1.0"
+dependencies = [
+ "punah-metadata",
+ "punah-store",
+ "punah-types",
+]
+
+[[package]]
 name = "punah-bench"
 version = "0.1.0"
 dependencies = [
  "punah-compaction",
+ "punah-device",
+ "punah-engine",
  "punah-metadata",
  "punah-network",
  "punah-protocol",
+ "punah-record",
  "punah-runtime",
  "punah-store",
  "punah-types",
@@ -132,6 +161,7 @@ version = "0.1.0"
 name = "punah-device"
 version = "0.1.0"
 dependencies = [
+ "io-uring",
  "memmap2",
 ]
 
@@ -202,6 +232,7 @@ dependencies = [
 name = "punah-runtime"
 version = "0.1.0"
 dependencies = [
+ "punah-compaction",
  "punah-engine",
  "punah-identity",
  "punah-store",

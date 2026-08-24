@@ -5,6 +5,9 @@ use std::cmp::Ordering;
 use punah_metadata::SegmentRef;
 use punah_types::SegmentStats;
 
+/// One whole reclaim ratio expressed in basis points.
+pub const FULL_RECLAIM_RATIO_BPS: u16 = 10_000;
+
 /// A segment visible to the compaction policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentCandidate {
@@ -27,6 +30,12 @@ pub struct PlanningLimits {
     pub max_input_bytes: u64,
     /// Extra capacity retained above the estimated live output.
     pub output_safety_margin_bytes: u64,
+    /// Minimum dead/expired share required for each selected segment.
+    /// `0` permits any positive reclaim; `10_000` selects only all-dead input.
+    pub minimum_reclaim_ratio_bps: u16,
+    /// Minimum number of selected inputs when live records require a
+    /// replacement. A single all-dead input may always be retired directly.
+    pub minimum_input_segments: usize,
 }
 
 /// A deterministic, I/O-free compaction decision.
@@ -44,6 +53,8 @@ pub struct CompactionPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanningError {
     NoEligibleSegments,
+    InvalidMinimumReclaimRatio(u16),
+    InvalidMinimumInputSegments,
     NoCompactionHeadroom {
         required_bytes: u64,
         usable_bytes: u64,
@@ -58,12 +69,21 @@ pub enum PlanningError {
 /// output is bounded by `max(live_bytes, total_bytes - reclaimable_bytes)`.
 ///
 /// # Errors
-/// Returns an explicit policy error when no segment is eligible, capacity above
-/// the emergency reserve is insufficient, or checked byte accounting overflows.
+/// Returns an explicit policy error when the minimum ratio is invalid, no
+/// segment is eligible, capacity above the emergency reserve is insufficient,
+/// or checked byte accounting overflows.
 pub fn plan_compaction(
     candidates: &[SegmentCandidate],
     limits: PlanningLimits,
 ) -> Result<CompactionPlan, PlanningError> {
+    if limits.minimum_reclaim_ratio_bps > FULL_RECLAIM_RATIO_BPS {
+        return Err(PlanningError::InvalidMinimumReclaimRatio(
+            limits.minimum_reclaim_ratio_bps,
+        ));
+    }
+    if limits.minimum_input_segments == 0 {
+        return Err(PlanningError::InvalidMinimumInputSegments);
+    }
     let usable_bytes = limits
         .available_bytes
         .checked_sub(limits.emergency_reserve_bytes)
@@ -85,6 +105,11 @@ pub fn plan_compaction(
         if candidate.stats.total_bytes > 0
             && reclaimable > 0
             && candidate.stats.total_bytes <= limits.max_input_bytes
+            && meets_minimum_reclaim_ratio(
+                reclaimable,
+                candidate.stats.total_bytes,
+                limits.minimum_reclaim_ratio_bps,
+            )
         {
             eligible.push(candidate);
         }
@@ -125,6 +150,9 @@ pub fn plan_compaction(
     if plan.input_segments.is_empty() {
         return Err(PlanningError::NoEligibleSegments);
     }
+    if plan.required_output_bytes > 0 && plan.input_segments.len() < limits.minimum_input_segments {
+        return Err(PlanningError::NoEligibleSegments);
+    }
     plan.required_headroom_bytes = plan
         .required_output_bytes
         .checked_add(limits.output_safety_margin_bytes)
@@ -136,6 +164,11 @@ pub fn plan_compaction(
         });
     }
     Ok(plan)
+}
+
+fn meets_minimum_reclaim_ratio(reclaimable: u64, total: u64, minimum_bps: u16) -> bool {
+    u128::from(reclaimable) * u128::from(FULL_RECLAIM_RATIO_BPS)
+        >= u128::from(total) * u128::from(minimum_bps)
 }
 
 fn compare_candidates(left: &SegmentCandidate, right: &SegmentCandidate) -> Ordering {
@@ -174,6 +207,8 @@ mod tests {
             emergency_reserve_bytes: 100,
             max_input_bytes: 1_000,
             output_safety_margin_bytes: 10,
+            minimum_reclaim_ratio_bps: 0,
+            minimum_input_segments: 1,
         }
     }
 
@@ -186,6 +221,72 @@ mod tests {
         assert_eq!(
             plan_compaction(&[candidate(1, 10, 10, 0)], limits()),
             Err(PlanningError::NoEligibleSegments)
+        );
+    }
+
+    #[test]
+    fn minimum_reclaim_ratio_is_per_segment_and_checks_exact_boundary() {
+        let mut value = limits();
+        value.minimum_reclaim_ratio_bps = 5_000;
+        let plan = plan_compaction(
+            &[
+                candidate(1, 100, 51, 49),
+                candidate(2, 100, 50, 50),
+                candidate(3, 100, 25, 75),
+            ],
+            value,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.input_segments.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_minimum_reclaim_ratio() {
+        let mut value = limits();
+        value.minimum_reclaim_ratio_bps = FULL_RECLAIM_RATIO_BPS + 1;
+        assert_eq!(
+            plan_compaction(&[candidate(1, 100, 0, 100)], value),
+            Err(PlanningError::InvalidMinimumReclaimRatio(10_001))
+        );
+    }
+
+    #[test]
+    fn replacement_requires_minimum_inputs_but_all_dead_can_retire_alone() {
+        let mut value = limits();
+        value.minimum_input_segments = 2;
+        assert_eq!(
+            plan_compaction(&[candidate(1, 100, 50, 50)], value),
+            Err(PlanningError::NoEligibleSegments)
+        );
+        assert_eq!(
+            plan_compaction(&[candidate(1, 100, 0, 100)], value)
+                .unwrap()
+                .input_segments
+                .len(),
+            1
+        );
+        assert_eq!(
+            plan_compaction(
+                &[candidate(1, 100, 50, 50), candidate(2, 100, 50, 50)],
+                value,
+            )
+            .unwrap()
+            .input_segments
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_zero_minimum_input_segments() {
+        let mut value = limits();
+        value.minimum_input_segments = 0;
+        assert_eq!(
+            plan_compaction(&[candidate(1, 100, 0, 100)], value),
+            Err(PlanningError::InvalidMinimumInputSegments)
         );
     }
 

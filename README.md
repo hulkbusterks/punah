@@ -39,6 +39,7 @@ Redis replacement.
 - `punah-events`: loss-aware, non-authoritative lifecycle observations
 - `punah-metadata`: crash-safe superblock, checkpoint, and journal publication
 - `punah-compaction`: deterministic bounded compaction planning
+- `punah-admin`: read-only inspection and explicit import/repair/quarantine tools
 - `punah-protocol`: Redgo-compatible v1 and native Punah v2 wire codecs
 - `punah-network`: bounded, stoppable TCP transport
 - `punah-record`: versioned durable record codec
@@ -51,12 +52,13 @@ Redis replacement.
 
 ## Development
 
-Install a stable Rust toolchain and run:
+The repository pins its tested Rust toolchain. Run:
 
 ```sh
-cargo test --workspace
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --all-features --no-deps --locked
 ```
 
 Generate the deterministic 1-to-64-agent reuse curve with:
@@ -71,36 +73,45 @@ Run a local node with an optional listen address and data directory:
 cargo run -p punah-server -- 127.0.0.1:7379 ./punah-data
 ```
 
+Inspect a store without modifying it, or explicitly adopt legacy segments:
+
+```sh
+cargo run -p punah-admin -- inspect ./punah-data/shard-0000
+cargo run -p punah-admin -- import ./punah-data/shard-0000 1073741824 default
+```
+
+`repair` is accepted only for nonzero corrupt roots and preserves the old
+metadata under `quarantine/`; `quarantine-orphans` moves only files proven
+unreferenced by a healthy root. Neither command deletes data.
+
 The macOS reference implementation is for correctness and scaling curves.
 SPDK/DPDK validation requires a suitable Linux host with direct device access.
 
-## Current portable baseline
+## Current portable measurements
 
-An initial release-mode smoke run on an Apple M4 MacBook Air demonstrates that
-the benchmark harness and durable recovery path work. These are regression
-anchors, **not competitive claims**: concurrency currently means independent
-stores, the run is a single sample, and the intentionally tiny 64 KiB segments
-make manifest publication and rotation unusually frequent.
+Release-mode Apple M4 development measurements now capture the important
+scaling changes, not a single headline number:
 
-| Workload | Payload | Workers | Throughput | Write p50 | Write p99 | Segments |
-|---|---:|---:|---:|---:|---:|---:|
-| Buffered write | 64 B | 1 | 12,099 ops/s | 10.9 µs | 31.8 µs | 5 |
-| Buffered write | 64 B | 4 | 15,260 ops/s | 11.5 µs | 1.78 ms | 8 |
-| Buffered write | 1 KiB | 1 | 2,976 ops/s | 27.7 µs | 15.8 ms | 20 |
-| Buffered write | 1 KiB | 4 | 3,815 ops/s | 44.0 µs | 28.1 ms | 24 |
-| Recovery | 64 B | 1 | 2.88 ms total | — | — | 5 |
-| Recovery | 1 KiB | 1 | 13.0 ms total | — | — | 19 |
+| Change | Before | After | Result |
+|---|---:|---:|---:|
+| Open 100k × 1 KiB records in a 1 GiB segment | 402.7 ms median | 22.89 ms median | 17.6x faster |
+| Local-durable TCP SET, 1 KiB, 16 clients/pipeline 16 | 394 ops/s | 2,986 ops/s | 7.6x throughput |
+| Writer LocalDurable, 64 B, singleton→mean 62.5 records/cohort | 126 ops/s | 7,945 ops/s | 62.8x via flush amortization |
+| Buffered shared node, 64 B, concurrency 16, 1→2 shards | 322.6k ops/s | 439.6k ops/s | sublinear scaling, then plateau |
+| 64 KiB GET response, contiguous→vectored output | 127.3k ops/s | 136.5k ops/s | provisional; validated rerun required |
 
-The exact command, raw CSV, environment, and interpretation are preserved in
-[the current benchmark baseline](docs/benchmark-baseline.md). The next benchmark
-milestone adds longer statistical runs, CPU/RSS/device measurements, TCP load,
-durable-mode sweeps, and equivalent Redis comparisons.
+These are regression anchors, not Linux or kernel-bypass claims. The recovery
+path is consistent with flat cost across preallocated capacity,
+local durability amortizes two flushes across bounded cohorts, and runtime
+admission is per-shard rather than globally locked. Scatter/gather is currently
+enabled only for bodies of at least 32 KiB; its preliminary development result
+is a threshold hypothesis, not yet a firm performance claim.
 
-A newer three-trial shared-node mixed run now reaches median aggregate rates of
-approximately 253k ops/s for 64-byte payloads on one client, 313k ops/s with
-four clients on one shard, and 155k ops/s for 1 KiB payloads with four clients
-across four shards. See the baseline document for the complete matrix and why
-these remain development measurements rather than comparative claims.
+The complete decisions, trial values, caveats, and commands are preserved in
+the [August 2026 optimization log](docs/optimization-log-2026-08.md). The
+[initial benchmark baseline](docs/benchmark-baseline.md) and
+[preliminary Redgo comparison](docs/redgo-performance-comparison.md) remain as
+historical checkpoints rather than descriptions of the current hot path.
 
 ## Design documentation
 
@@ -117,6 +128,7 @@ these remain development measurements rather than comparative claims.
 - [Swarm reuse simulation](docs/swarm-simulation.md)
 - [Cluster membership authority](docs/cluster-authority.md)
 - [Safety policy](docs/safety.md)
+- [Verification and fuzzing](docs/verification.md)
 - [Platform support and acceleration](docs/platforms.md)
 - [Component and policy boundaries](docs/component-boundaries.md)
 - [Code organization](docs/code-organization.md)
@@ -124,6 +136,7 @@ these remain development measurements rather than comparative claims.
 - [Redgo parity definition](docs/redgo-parity.md)
 - [Benchmark policy](docs/benchmarks.md)
 - [Current benchmark baseline](docs/benchmark-baseline.md)
+- [August 2026 optimization log](docs/optimization-log-2026-08.md)
 - [Preliminary Redgo performance comparison](docs/redgo-performance-comparison.md)
 
 ## License

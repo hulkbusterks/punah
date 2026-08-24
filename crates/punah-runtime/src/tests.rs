@@ -35,6 +35,73 @@ fn routing_is_stable_and_power_of_two_bounded() {
 }
 
 #[test]
+fn idle_background_compaction_reclaims_superseded_segments_and_reports_pause() {
+    let mut cfg = config("background-compaction", 1, 8);
+    cfg.segment_capacity = 320;
+    let runtime = Runtime::open_with_compaction(
+        &cfg,
+        BackgroundCompaction::bounded_with_policy(1, 320, 320, 0, 1, Duration::from_secs(1)),
+    )
+    .unwrap();
+    let handle = runtime.handle();
+    handle.set(b"key", b"old".to_vec(), None).unwrap();
+    handle.set(b"key", b"new".to_vec(), None).unwrap();
+    handle.set(b"filler", vec![7; 40], None).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let snapshot = loop {
+        let snapshot = handle.maintenance_snapshots()[0];
+        if snapshot.compactions > 0 {
+            break snapshot;
+        }
+        assert!(std::time::Instant::now() < deadline, "compaction timed out");
+        thread::yield_now();
+    };
+    assert!(snapshot.checks >= 2);
+    assert_eq!(snapshot.compactions, 1);
+    assert!(snapshot.input_bytes > 0);
+    assert!(snapshot.reclaimable_bytes > 0);
+    assert!(snapshot.copied_bytes > 0);
+    assert_eq!(snapshot.max_input_bytes, snapshot.input_bytes);
+    assert_eq!(snapshot.max_copied_bytes, snapshot.copied_bytes);
+    assert!(snapshot.last_pause_ns > 0);
+    assert!(snapshot.max_pause_ns >= snapshot.last_pause_ns);
+    assert_eq!(snapshot.pause_budget_exceeded, 0);
+    assert_eq!(handle.get(b"key").unwrap(), Some(b"new".to_vec()));
+
+    runtime.shutdown();
+    fs::remove_dir_all(cfg.directory).unwrap();
+}
+
+#[test]
+fn invalid_background_compaction_policy_is_rejected_before_opening_shards() {
+    let cfg = config("invalid-background-compaction", 1, 8);
+    assert!(matches!(
+        Runtime::open_with_compaction(
+            &cfg,
+            BackgroundCompaction::bounded(0, 320, 320, Duration::from_secs(1)),
+        ),
+        Err(OpenError::InvalidCompactionPolicy)
+    ));
+    assert!(!cfg.directory.exists());
+
+    assert!(matches!(
+        Runtime::open_with_compaction(
+            &cfg,
+            BackgroundCompaction::bounded_with_minimum_reclaim_ratio(
+                1,
+                320,
+                320,
+                10_001,
+                Duration::from_secs(1),
+            ),
+        ),
+        Err(OpenError::InvalidCompactionPolicy)
+    ));
+    assert!(!cfg.directory.exists());
+}
+
+#[test]
 fn exact_binary_keys_remain_distinct() {
     let cfg = config("keys", 2, 8);
     let runtime = Runtime::open(&cfg).unwrap();
@@ -84,6 +151,169 @@ fn batch_preserves_input_order_across_shards() {
 }
 
 #[test]
+fn storage_telemetry_reports_actual_runtime_cohort_and_flush_count() {
+    let mut cfg = config("storage-telemetry", 1, 8);
+    cfg.durability = Durability::LocalDurable;
+    let runtime = Runtime::open(&cfg).unwrap();
+    let handle = runtime.handle();
+    handle
+        .execute_batch(vec![
+            BatchCommand::Set {
+                key: b"a".to_vec(),
+                value: b"one".to_vec(),
+                ttl: None,
+            },
+            BatchCommand::Set {
+                key: b"b".to_vec(),
+                value: b"two".to_vec(),
+                ttl: None,
+            },
+            BatchCommand::Delete { key: b"a".to_vec() },
+        ])
+        .unwrap();
+    let telemetry = handle.storage_telemetry().unwrap();
+    assert_eq!(telemetry.len(), 1);
+    assert_eq!(telemetry[0].storage.cohort_appends, 1);
+    assert_eq!(telemetry[0].storage.appended_records, 3);
+    assert_eq!(telemetry[0].storage.durability_flushes, 2);
+    assert_eq!(telemetry[0].storage.max_records_per_append, 3);
+    runtime.shutdown();
+    fs::remove_dir_all(cfg.directory).unwrap();
+}
+
+#[test]
+fn drained_batches_share_mutation_runs_without_crossing_get_barriers() {
+    let cfg = config("drained-batches", 1, 8);
+    let mut store = Store::open(StoreConfig {
+        directory: cfg.directory.clone(),
+        namespace: cfg.namespace.clone(),
+        segment_capacity: cfg.segment_capacity,
+        durability: Durability::Buffered,
+    })
+    .unwrap();
+    let (first_reply, first_result) = mpsc::sync_channel(1);
+    let (second_reply, second_result) = mpsc::sync_channel(1);
+    execute_batch_requests(
+        &mut store,
+        vec![
+            QueuedBatch {
+                commands: vec![(
+                    0,
+                    BatchCommand::Set {
+                        key: b"key".to_vec(),
+                        value: b"one".to_vec(),
+                        ttl: None,
+                    },
+                )],
+                reply: first_reply,
+            },
+            QueuedBatch {
+                commands: vec![
+                    (
+                        0,
+                        BatchCommand::Get {
+                            key: b"key".to_vec(),
+                        },
+                    ),
+                    (
+                        1,
+                        BatchCommand::Delete {
+                            key: b"key".to_vec(),
+                        },
+                    ),
+                    (
+                        2,
+                        BatchCommand::Set {
+                            key: b"key".to_vec(),
+                            value: b"two".to_vec(),
+                            ttl: None,
+                        },
+                    ),
+                    (
+                        3,
+                        BatchCommand::Get {
+                            key: b"key".to_vec(),
+                        },
+                    ),
+                ],
+                reply: second_reply,
+            },
+        ],
+    );
+
+    assert!(matches!(
+        first_result.recv().unwrap()[0].1,
+        Ok(BatchValue::Set)
+    ));
+    let second = second_result.recv().unwrap();
+    assert!(matches!(
+        &second[0].1,
+        Ok(BatchValue::Get(Some(value))) if value == b"one"
+    ));
+    assert!(matches!(second[1].1, Ok(BatchValue::Delete(true))));
+    assert!(matches!(second[2].1, Ok(BatchValue::Set)));
+    assert!(matches!(
+        &second[3].1,
+        Ok(BatchValue::Get(Some(value))) if value == b"two"
+    ));
+    drop(store);
+    fs::remove_dir_all(cfg.directory).unwrap();
+}
+
+#[test]
+fn malformed_drained_request_does_not_abort_an_unrelated_valid_request() {
+    let cfg = config("drained-invalid", 1, 8);
+    let mut store = Store::open(StoreConfig {
+        directory: cfg.directory.clone(),
+        namespace: cfg.namespace.clone(),
+        segment_capacity: cfg.segment_capacity,
+        durability: Durability::Buffered,
+    })
+    .unwrap();
+    let (valid_reply, valid_result) = mpsc::sync_channel(1);
+    let (invalid_reply, invalid_result) = mpsc::sync_channel(1);
+    execute_batch_requests(
+        &mut store,
+        vec![
+            QueuedBatch {
+                commands: vec![(
+                    0,
+                    BatchCommand::Set {
+                        key: b"valid".to_vec(),
+                        value: b"value".to_vec(),
+                        ttl: None,
+                    },
+                )],
+                reply: valid_reply,
+            },
+            QueuedBatch {
+                commands: vec![(
+                    0,
+                    BatchCommand::Set {
+                        key: vec![0; usize::from(u16::MAX) + 1],
+                        value: b"invalid".to_vec(),
+                        ttl: None,
+                    },
+                )],
+                reply: invalid_reply,
+            },
+        ],
+    );
+
+    assert!(matches!(
+        valid_result.recv().unwrap()[0].1,
+        Ok(BatchValue::Set)
+    ));
+    assert!(matches!(
+        invalid_result.recv().unwrap()[0].1,
+        Err(RuntimeError::Store(StoreError::Encode(_)))
+    ));
+    assert_eq!(store.get(b"valid").unwrap(), Some(b"value".to_vec()));
+    drop(store);
+    fs::remove_dir_all(cfg.directory).unwrap();
+}
+
+#[test]
 fn concurrent_handles_share_one_node_without_store_locking() {
     let cfg = config("concurrent", 4, 64);
     let runtime = Runtime::open(&cfg).unwrap();
@@ -110,13 +340,40 @@ fn concurrent_handles_share_one_node_without_store_locking() {
 }
 
 #[test]
+fn one_shard_admission_gate_does_not_block_another_shard() {
+    let cfg = config("independent-ingress", 2, 8);
+    let runtime = Runtime::open(&cfg).unwrap();
+    let handle = runtime.handle();
+    let shard_one_key = (0_u64..10_000)
+        .map(|value| value.to_le_bytes().to_vec())
+        .find(|key| handle.shard_for(key) == 1)
+        .expect("one key routes to shard one");
+    let shard_zero_guard = lock_ingress(&handle.shared.ingresses[0]);
+    let (completed, completion) = mpsc::sync_channel(1);
+    let other_shard = handle.clone();
+    let worker = thread::spawn(move || {
+        completed.send(other_shard.get(&shard_one_key)).unwrap();
+    });
+
+    assert!(matches!(
+        completion.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Ok(None)
+    ));
+    drop(shard_zero_guard);
+    worker.join().unwrap();
+    runtime.shutdown();
+    fs::remove_dir_all(cfg.directory).unwrap();
+}
+
+#[test]
 fn bounded_queue_reports_backpressure() {
     let cfg = config("pressure", 1, 1);
     let runtime = Runtime::open(&cfg).unwrap();
     let handle = runtime.handle();
     let (release, blocked) = mpsc::sync_channel(0);
     let (entered, started) = mpsc::sync_channel(0);
-    handle.shared.senders[0]
+    handle.shared.ingresses[0]
+        .sender
         .send(Request::Barrier {
             entered,
             release: blocked,
@@ -124,7 +381,8 @@ fn bounded_queue_reports_backpressure() {
         .unwrap();
     started.recv().unwrap();
     let (reply, _ignored) = mpsc::sync_channel(1);
-    handle.shared.senders[0]
+    handle.shared.ingresses[0]
+        .sender
         .try_send(Request::Get {
             key: b"queued".to_vec(),
             reply,

@@ -37,15 +37,18 @@ polling device and transport traits
 ```
 
 An optimized adapter may strengthen performance but may not weaken commit,
-ownership, fencing, checksum, or recovery invariants. `unsafe` remains denied
-workspace-wide; future FFI crates must opt in locally, document every safety
-contract, and expose safe ownership-based APIs to the rest of Punah.
+ownership, fencing, checksum, or recovery invariants. `unsafe` is denied by
+default. The mapped-file module and Linux `io_uring` SQE submission module are
+the two documented local exceptions; future FFI crates must opt in locally,
+document every safety contract, and expose ownership-based safe APIs to the
+rest of Punah.
 
 ## Optimization order
 
 1. Establish shared-node workload curves with the portable backend.
 2. Remove algorithmic allocation, serialization, and queue bottlenecks.
-3. Add a bounded io_uring backend as the first Linux-native step.
+3. Measure the checked-in bounded ordinary-file `io_uring` backend against
+   `FileDevice`; it intentionally has no direct-I/O or registered-buffer claims.
 4. Measure whether kernel networking is limiting the intended workload.
 5. Add SPDK for direct NVMe access when storage measurements justify it.
 6. Add DPDK or RDMA only when network measurements justify their operational
@@ -53,6 +56,19 @@ contract, and expose safe ownership-based APIs to the rest of Punah.
 
 This order keeps local development useful and prevents specialized hardware
 from hiding incorrect lifecycle or concurrency semantics.
+
+The Linux-only `UringDevice` now implements the same owned-buffer `BlockDevice`
+contract with bounded admission, request-ID/CQE correlation, asynchronous
+read/write, and `Fsync(DATASYNC)`. The matching writer benchmark is:
+
+```sh
+cargo run --release --locked -p punah-bench --bin uring_compare -- \
+  30000 1024 64 64 5
+```
+
+Run it on disclosed Linux kernel/filesystem/hardware. The binary returns an
+explicit unsupported error on other platforms; this repository records no
+`io_uring` performance number from macOS.
 
 ## Product boundary
 

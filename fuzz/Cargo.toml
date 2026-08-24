@@ -1,0 +1,32 @@
+[package]
+name = "punah-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+punah-metadata = { path = "../crates/punah-metadata" }
+punah-protocol = { path = "../crates/punah-protocol" }
+punah-record = { path = "../crates/punah-record" }
+punah-types = { path = "../crates/punah-types" }
+
+[[bin]]
+name = "decode_untrusted"
+path = "fuzz_targets/decode_untrusted.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_formats"
+path = "fuzz_targets/roundtrip_formats.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

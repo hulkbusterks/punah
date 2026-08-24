@@ -1,14 +1,20 @@
 #![deny(unsafe_code)]
 
+mod crash;
 mod file;
 mod mapped;
 mod memory;
+#[cfg(target_os = "linux")]
+mod uring;
 
 use std::fmt;
 
+pub use crash::CrashDevice;
 pub use file::FileDevice;
 pub use mapped::{MappedReadError, MappedSegment};
 pub use memory::MemoryDevice;
+#[cfg(target_os = "linux")]
+pub use uring::UringDevice;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct RequestId(pub u64);
@@ -68,7 +74,11 @@ impl std::error::Error for DeviceError {}
 /// A queue-owned, polling-oriented device.
 ///
 /// Implementations are intentionally mutable: one worker owns a device queue
-/// and drives both submission and completion polling.
+/// and drives both submission and completion polling. Completions may arrive
+/// in any order and must be correlated by [`RequestId`]. A successful flush
+/// persists every successful write completion observed before that flush was
+/// submitted; callers must wait for a write phase before submitting its
+/// durability barrier.
 pub trait BlockDevice {
     /// Submits an operation without blocking for its completion.
     ///
@@ -78,5 +88,8 @@ pub trait BlockDevice {
     /// submission, or another device error when the request is invalid.
     fn submit(&mut self, request: IoRequest) -> Result<(), SubmitError>;
 
+    /// Appends at most `limit` newly observed completions and returns the
+    /// number appended. Existing entries in `completions` do not consume the
+    /// limit.
     fn poll(&mut self, completions: &mut Vec<IoCompletion>, limit: usize) -> usize;
 }

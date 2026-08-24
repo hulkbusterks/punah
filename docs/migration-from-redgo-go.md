@@ -11,7 +11,8 @@ are durable tombstones, rotation reopens the committed tail, response writes
 are complete writes, accepted sockets have an explicit blocking mode, and
 active connections are accounted through RAII. Expired values can be removed
 with a bounded explicit pass that durably prevents resurrection. Physical
-space reclamation is intentionally deferred to compaction.
+space reclamation is now available through explicit bounded compaction, which
+copies only still-current records and publishes authoritative manifest changes.
 
 This document preserves valuable context from the original Redgo implementation.
 It records deliberate changes so that later optimization does not erase the
@@ -32,6 +33,11 @@ metadata while append-only segments own payload bytes. This keeps index growth
 related to object count rather than payload volume and supports mmap, ordinary
 files, and SPDK without changing the logical engine.
 
+Punah maps every preallocated segment, but its safe API exposes bytes only
+inside a checked closure. GET makes one owned payload copy so synchronous
+compaction cannot retire a mapping during a response. Large network responses
+then use scatter/gather to avoid building another payload-sized frame.
+
 ## Log and arena
 
 The Go plan contained separate WAL, Bitcask, and mmap arena concepts at
@@ -45,6 +51,11 @@ The Go mmap arena preallocated files and treated physical file size as the
 current append offset after restart. These are distinct in Rust: capacity is
 physical, while the committed logical boundary comes from validated records or
 segment metadata. Preallocation cannot make a new segment appear full.
+
+Recovery no longer scales with unused capacity: it examines one zero header at
+the active boundary instead of scanning the remaining file. Sealed manifest
+lengths are strict. A nonzero corrupt metadata root fails closed rather than
+falling back to filename discovery.
 
 ## Recoverability
 
@@ -64,25 +75,26 @@ eventually reclaims old segments.
 ## Sharding
 
 The Go shard calculation used a bit mask and therefore silently required a
-power-of-two shard count. Rust will either enforce that constraint explicitly
-or use a mapping algorithm whose requirements are represented by its type. The
-production target is per-core shard ownership rather than a globally shared
-map protected by many locks.
+power-of-two shard count. Rust validates that constraint explicitly. One worker
+owns each configured shard and Store; submission uses a per-shard shutdown gate,
+not a global data or admission mutex.
 
 ## Networking and I/O
 
-Go goroutines and kernel TCP were appropriate for the prototype. The target
-Rust data plane uses pinned polling workers with owned NIC and NVMe queues.
-Portable polling backends preserve this execution model during development.
-Conventional async Rust remains suitable for the control plane, not the
-SPDK/DPDK hot path.
+Go goroutines and kernel TCP were appropriate for the prototype. The portable
+Rust path already uses bounded TCP batches, shard-owned workers, polling device
+requests, and explicit backpressure. Local-durable workers form zero-wait,
+bounded mutation cohorts so many records share two flush barriers. The Linux
+target replaces portable file/socket adapters with pinned NIC and NVMe queues
+without changing ownership or durability semantics.
 
 ## Memory safety
 
 The Go runtime reduced many lifetime concerns but conflicted with off-heap and
 kernel-bypass goals. Rust makes ownership explicit. Unsafe operations are not
-spread through the engine; they are confined to future FFI, DMA, mmap, and ring
-modules with safe ownership-transfer APIs above them.
+spread through the engine: the current `MmapRaw` conversion is isolated behind
+a checked closure API, and future FFI, DMA, and ring modules must provide the
+same kind of documented ownership boundary.
 
 ## Performance claims
 
@@ -90,3 +102,8 @@ The Go README included throughput and latency targets before reproducible
 measurements existed. Rust documentation separates targets from results and
 prioritizes scaling curves, tail latency, recovery cost, and agent-level work
 saved.
+
+The current measured history—including single-encode admission, mmap recovery,
+durable group commit, per-shard ingress, and response scatter/gather—is kept in
+[the optimization log](optimization-log-2026-08.md) so future accelerator work
+does not accidentally restore a Redgo-era bottleneck.

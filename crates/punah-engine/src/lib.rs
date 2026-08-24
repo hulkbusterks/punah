@@ -12,5 +12,7 @@ pub use index::{
 };
 pub use lease::{AcquireResult, Lease, LeaseError, LeaseTable, LeaseToken};
 pub use recovery::{RecoveryError, RecoveryReport, recover_segment};
-pub use segment::{AppendCompletion, AppendError, AppendRejected, AppendTicket, SegmentWriter};
+pub use segment::{
+    AppendCompletion, AppendError, AppendRejected, AppendTicket, CohortRejected, SegmentWriter,
+};
 pub use sharded::{ExpiryReport, ShardedIndex, ShardedIndexError};

@@ -1,0 +1,30 @@
+name: Scheduled fuzzing
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formats:
+    name: Durable and wire formats
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned nightly toolchain
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz untrusted decoders
+        run: cargo +nightly-2026-08-20 fuzz run decode_untrusted -- -max_total_time=180 -max_len=65536 -rss_limit_mb=2048
+      - name: Fuzz valid-format round trips
+        run: cargo +nightly-2026-08-20 fuzz run roundtrip_formats -- -max_total_time=180 -max_len=65536 -rss_limit_mb=2048

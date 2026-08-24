@@ -51,12 +51,13 @@ identical CRC32-C v1 frames. Each table cell is the median throughput of three
 | 1 KiB | 16 | SET | 175,966 | 140,667 | 1.25x |
 | 1 KiB | 16 | Mixed | 180,451 | 150,259 | 1.20x |
 
-Redgo currently wins this request/response throughput test. Its connection
+In this initial measurement, Redgo won the request/response throughput test. Its connection
 goroutine directly takes the selected map/arena locks. Punah performs an extra
 bounded-channel submission, allocation/copy, wakeup, and reply for every
 request so that one thread exclusively owns each durable shard. That ownership
-model is intended for batching and polling, but the portable TCP adapter does
-not batch yet and therefore pays the cost without receiving the benefit.
+model was intended for batching and polling, but this measured revision did not
+yet batch and therefore paid the cost without receiving the benefit. Later
+sections record the first batching follow-up.
 
 ## Sustained churn and tail behavior
 
@@ -98,7 +99,7 @@ substantially lower resident memory and better extreme-tail behavior under
 churn, while also implementing stronger recovery, tombstone, fencing, and
 identity semantics.
 
-The next measured optimization target is the TCP-to-owner boundary:
+The next measured optimization target at that point was the TCP-to-owner boundary:
 
 1. submit batches rather than one request per channel wakeup;
 2. pass owned frame buffers through without cloning key/value fields again;
@@ -187,3 +188,12 @@ target/release/tcp_compare 127.0.0.1:7379 set 100000 1024 16 16 100000
 ```
 
 Output is CSV containing elapsed time, throughput, p50, p99, and p99.9.
+
+## Current status
+
+This document intentionally preserves the original comparison and its
+follow-ups. It is not the current hot-path description: Punah now also has
+single-encode admission, capacity-flat mmap recovery, durable storage cohorts,
+per-shard ingress gates, and size-thresholded response scatter/gather. Their
+trial values and design reasons are in the
+[August 2026 optimization log](optimization-log-2026-08.md).

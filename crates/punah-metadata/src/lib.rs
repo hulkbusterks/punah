@@ -6,6 +6,9 @@ mod manifest;
 mod publication;
 mod superblock;
 
+#[cfg(test)]
+mod golden_tests;
+
 pub use journal::{
     JOURNAL_COMMIT_MARKER_OFFSET, JournalEntry, JournalOperation, SegmentRef, commit_journal_entry,
     decode_journal_entry, encode_journal_entry, encode_uncommitted_journal_entry,

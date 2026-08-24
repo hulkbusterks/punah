@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime};
 
-use punah_record::{DecodeError, Record, RecordType};
-use punah_types::{ArtifactEntry, RecordLocation, SegmentId};
+use punah_record::{DecodeError, RECORD_HEADER_LEN, RecordRef, RecordType};
+use punah_types::{ArtifactEntry, Namespace, RecordLocation, SegmentId};
 
 use crate::ReferenceIndex;
 
@@ -19,10 +19,12 @@ pub struct RecoveryReport {
     pub committed_boundary: u64,
 }
 
-/// Rebuilds an index from a contiguous segment image.
+/// Rebuilds an index from an active segment's contiguous committed prefix.
 ///
-/// Zero-filled and uncommitted trailing space is treated as the unused tail of
-/// a preallocated segment. Corruption inside committed data is reported.
+/// The first all-zero record header, an incomplete record, or an uncommitted
+/// record begins the unused tail of a preallocated segment. Bytes after that
+/// boundary are not inspected because active appends never leave gaps.
+/// Corruption before the boundary is reported.
 ///
 /// # Errors
 ///
@@ -39,10 +41,12 @@ pub fn recover_segment(
 
     while cursor < bytes.len() {
         let tail = &bytes[cursor..];
-        if tail.iter().all(|byte| *byte == 0) {
+        if tail.len() >= RECORD_HEADER_LEN
+            && tail[..RECORD_HEADER_LEN].iter().all(|byte| *byte == 0)
+        {
             break;
         }
-        let decoded = match punah_record::decode(tail) {
+        let decoded = match punah_record::decode_ref(tail) {
             Ok(decoded) => decoded,
             Err(DecodeError::Incomplete | DecodeError::InvalidCommitMarker) => break,
             Err(source) => {
@@ -66,7 +70,7 @@ pub fn recover_segment(
                 stored_len,
                 logical_len: stored_len,
             },
-        );
+        )?;
         cursor = cursor
             .checked_add(decoded.encoded_len)
             .ok_or(RecoveryError::OffsetOverflow)?;
@@ -81,10 +85,16 @@ pub fn recover_segment(
 fn apply_recovered_record(
     index: &mut ReferenceIndex,
     report: &mut RecoveryReport,
-    record: Record,
+    record: RecordRef<'_>,
     mut location: RecordLocation,
-) {
-    location.logical_len = u32::try_from(record.payload.len()).unwrap_or(u32::MAX);
+) -> Result<(), RecoveryError> {
+    let namespace =
+        Namespace::new(record.namespace.to_vec()).map_err(|_| RecoveryError::Corrupt {
+            offset: location.offset,
+            source: DecodeError::InvalidNamespace,
+        })?;
+    location.logical_len =
+        u32::try_from(record.payload.len()).map_err(|_| RecoveryError::OffsetOverflow)?;
     match record.record_type {
         RecordType::Artifact => {
             let created_at =
@@ -93,7 +103,7 @@ fn apply_recovered_record(
                 .expires_at_unix_ns
                 .map(|timestamp| SystemTime::UNIX_EPOCH + Duration::from_nanos(timestamp));
             if index.insert_latest(ArtifactEntry {
-                namespace: record.namespace,
+                namespace,
                 content_hash: record.content_hash,
                 operation_hash: record.operation_hash,
                 sequence: record.sequence,
@@ -106,14 +116,10 @@ fn apply_recovered_record(
             }
         }
         RecordType::Tombstone => {
-            if index.apply_tombstone(
-                &record.namespace,
-                &record.content_hash,
-                record.sequence,
-                location,
-            ) {
+            if index.apply_tombstone(&namespace, &record.content_hash, record.sequence, location) {
                 report.tombstones_applied += 1;
             }
         }
     }
+    Ok(())
 }

@@ -3,7 +3,7 @@
 //! Portable shard-owned execution for Punah stores.
 //!
 //! Each exact key has one deterministic owner. A worker thread exclusively owns
-//! that shard's [`Store`](punah_store::Store), so storage mutation needs neither
+//! that shard's [`punah_store::Store`], so storage mutation needs neither
 //! a shared store mutex nor ambient global state. Bounded request queues make
 //! overload visible to callers.
 //!
@@ -12,20 +12,32 @@
 //! successfully published result is ordinary Store data and follows the
 //! configured durability and restart guarantees.
 
+mod maintenance;
+
+pub use maintenance::{BackgroundCompaction, MaintenanceSnapshot};
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use punah_engine::{AcquireResult, LeaseError, LeaseTable, LeaseToken};
 use punah_identity::shard_hash;
-use punah_store::{CleanupReport, Store, StoreConfig, StoreError};
+use punah_store::{
+    CleanupReport, MutationValue, Store, StoreConfig, StoreError, StoreIoTelemetry, StoreMutation,
+};
 use punah_types::{Durability, Namespace, OperationHash};
+
+use crate::maintenance::{MaintenanceCounters, MaintenanceScheduler};
 
 static NEXT_RUNTIME_EPOCH: AtomicU64 = AtomicU64::new(1);
 const OPERATION_RESULT_DOMAIN: u8 = 0x02;
+const MAX_DRAINED_BATCH_MESSAGES: usize = 64;
+const MAX_DRAINED_MUTATIONS: usize = 64;
+const MAX_DRAINED_MUTATION_BYTES: usize = 1024 * 1024;
+const MUTATION_RECORD_OVERHEAD_ESTIMATE: usize = 256;
 
 fn operation_result_key(operation: &OperationHash) -> [u8; 33] {
     let mut key = [0_u8; 33];
@@ -68,6 +80,7 @@ pub struct RuntimeConfig {
 pub enum OpenError {
     InvalidShardCount,
     InvalidQueueCapacity,
+    InvalidCompactionPolicy,
     Store { shard: usize, source: StoreError },
     WorkerSpawn(std::io::Error),
 }
@@ -114,6 +127,13 @@ pub enum BatchValue {
     Get(Option<Vec<u8>>),
     Set,
     Delete(bool),
+}
+
+/// Actual successful foreground append counters reported by one owner shard.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShardStorageTelemetry {
+    pub shard: usize,
+    pub storage: StoreIoTelemetry,
 }
 
 enum Request {
@@ -170,6 +190,9 @@ enum Request {
         ttl: Option<Duration>,
         reply: SyncSender<Result<(), RuntimeError>>,
     },
+    StorageTelemetry {
+        reply: SyncSender<StoreIoTelemetry>,
+    },
     Shutdown,
     #[cfg(test)]
     Barrier {
@@ -178,10 +201,20 @@ enum Request {
     },
 }
 
+struct QueuedBatch {
+    commands: Vec<(usize, BatchCommand)>,
+    reply: SyncSender<Vec<(usize, Result<BatchValue, RuntimeError>)>>,
+}
+
+struct ShardIngress {
+    sender: SyncSender<Request>,
+    gate: Mutex<()>,
+    maintenance: Arc<MaintenanceCounters>,
+}
+
 struct Shared {
-    senders: Vec<SyncSender<Request>>,
+    ingresses: Vec<ShardIngress>,
     accepting: AtomicBool,
-    submission_gate: Mutex<()>,
 }
 
 /// Cloneable submission side of a [`Runtime`].
@@ -194,7 +227,45 @@ impl RuntimeHandle {
     /// Returns the stable owner index for an exact key.
     #[must_use]
     pub fn shard_for(&self, key: &[u8]) -> usize {
-        route(key, self.shared.senders.len())
+        route(key, self.shared.ingresses.len())
+    }
+
+    /// Returns monotonic maintenance counters for every owned shard.
+    #[must_use]
+    pub fn maintenance_snapshots(&self) -> Vec<MaintenanceSnapshot> {
+        self.shared
+            .ingresses
+            .iter()
+            .enumerate()
+            .map(|(shard, ingress)| ingress.maintenance.snapshot(shard))
+            .collect()
+    }
+
+    /// Retrieves actual append/cohort/flush/rotation counters from every owner.
+    ///
+    /// # Errors
+    /// Returns backpressure if any owner cannot accept the observation request,
+    /// or shutdown if admission has closed.
+    pub fn storage_telemetry(&self) -> Result<Vec<ShardStorageTelemetry>, RuntimeError> {
+        let mut replies = Vec::with_capacity(self.shared.ingresses.len());
+        for (shard, ingress) in self.shared.ingresses.iter().enumerate() {
+            let (reply, receiver) = mpsc::sync_channel(1);
+            let _guard = lock_ingress(ingress);
+            if !self.shared.accepting.load(Ordering::Acquire) {
+                return Err(RuntimeError::Shutdown);
+            }
+            try_send(&ingress.sender, Request::StorageTelemetry { reply })?;
+            replies.push((shard, receiver));
+        }
+        replies
+            .into_iter()
+            .map(|(shard, receiver)| {
+                receiver
+                    .recv()
+                    .map(|storage| ShardStorageTelemetry { shard, storage })
+                    .map_err(|_| RuntimeError::Shutdown)
+            })
+            .collect()
     }
 
     /// Executes owned commands in shard-local batches and restores input order.
@@ -214,17 +285,13 @@ impl RuntimeHandle {
             return Ok(Vec::new());
         }
         let command_count = commands.len();
-        let mut shards: Vec<Vec<(usize, BatchCommand)>> =
-            (0..self.shared.senders.len()).map(|_| Vec::new()).collect();
+        let mut shards: Vec<Vec<(usize, BatchCommand)>> = (0..self.shared.ingresses.len())
+            .map(|_| Vec::new())
+            .collect();
         for (index, command) in commands.into_iter().enumerate() {
             shards[self.shard_for(command.key())].push((index, command));
         }
 
-        let guard = self
-            .shared
-            .submission_gate
-            .lock()
-            .map_err(|_| RuntimeError::Shutdown)?;
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(RuntimeError::Shutdown);
         }
@@ -237,7 +304,17 @@ impl RuntimeHandle {
             }
             let indexes: Vec<_> = commands.iter().map(|(index, _)| *index).collect();
             let (reply, receiver) = mpsc::sync_channel(1);
-            match self.shared.senders[shard].try_send(Request::Batch { commands, reply }) {
+            let ingress = &self.shared.ingresses[shard];
+            let _guard = lock_ingress(ingress);
+            let submission = if self.shared.accepting.load(Ordering::Acquire) {
+                ingress.sender.try_send(Request::Batch { commands, reply })
+            } else {
+                for index in indexes {
+                    results[index] = Some(Err(RuntimeError::Shutdown));
+                }
+                continue;
+            };
+            match submission {
                 Ok(()) => replies.push(receiver),
                 Err(TrySendError::Full(_)) => {
                     for index in indexes {
@@ -251,7 +328,6 @@ impl RuntimeHandle {
                 }
             }
         }
-        drop(guard);
         for receiver in replies {
             for (index, result) in receiver.recv().map_err(|_| RuntimeError::Shutdown)? {
                 results[index] = Some(result);
@@ -324,19 +400,18 @@ impl RuntimeHandle {
     /// Returns without hiding partial admission if a shard queue is full. Any
     /// already accepted cleanup requests still complete on their owners.
     pub fn cleanup_expired(&self, budget_per_shard: usize) -> Result<CleanupReport, RuntimeError> {
-        let mut replies = Vec::with_capacity(self.shared.senders.len());
-        let guard = self
-            .shared
-            .submission_gate
-            .lock()
-            .map_err(|_| RuntimeError::Shutdown)?;
+        let mut replies = Vec::with_capacity(self.shared.ingresses.len());
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(RuntimeError::Shutdown);
         }
-        for sender in &self.shared.senders {
+        for ingress in &self.shared.ingresses {
             let (reply, result) = mpsc::sync_channel(1);
+            let _guard = lock_ingress(ingress);
+            if !self.shared.accepting.load(Ordering::Acquire) {
+                return Err(RuntimeError::Shutdown);
+            }
             try_send(
-                sender,
+                &ingress.sender,
                 Request::Cleanup {
                     budget: budget_per_shard,
                     reply,
@@ -344,7 +419,6 @@ impl RuntimeHandle {
             )?;
             replies.push(result);
         }
-        drop(guard);
         let mut combined = CleanupReport::default();
         for reply in replies {
             let report = receive(&reply)?;
@@ -465,15 +539,12 @@ impl RuntimeHandle {
     }
 
     fn submit(&self, key: &[u8], request: Request) -> Result<(), RuntimeError> {
-        let _guard = self
-            .shared
-            .submission_gate
-            .lock()
-            .map_err(|_| RuntimeError::Shutdown)?;
+        let ingress = &self.shared.ingresses[self.shard_for(key)];
+        let _guard = lock_ingress(ingress);
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(RuntimeError::Shutdown);
         }
-        try_send(&self.shared.senders[self.shard_for(key)], request)
+        try_send(&ingress.sender, request)
     }
 }
 
@@ -489,11 +560,25 @@ impl Runtime {
     /// # Errors
     /// Returns invalid configuration, shard storage, or worker-spawn failures.
     pub fn open(config: &RuntimeConfig) -> Result<Self, OpenError> {
+        Self::open_with_compaction(config, BackgroundCompaction::Disabled)
+    }
+
+    /// Opens shard stores with an explicit idle-time compaction policy.
+    ///
+    /// # Errors
+    /// Returns invalid configuration, shard storage, or worker-spawn failures.
+    pub fn open_with_compaction(
+        config: &RuntimeConfig,
+        compaction: BackgroundCompaction,
+    ) -> Result<Self, OpenError> {
         if config.shard_count == 0 || !config.shard_count.is_power_of_two() {
             return Err(OpenError::InvalidShardCount);
         }
         if config.queue_capacity == 0 {
             return Err(OpenError::InvalidQueueCapacity);
+        }
+        if !compaction.is_valid() {
+            return Err(OpenError::InvalidCompactionPolicy);
         }
         let mut stores = Vec::with_capacity(config.shard_count);
         for shard in 0..config.shard_count {
@@ -508,24 +593,39 @@ impl Runtime {
             );
         }
 
-        let mut senders = Vec::with_capacity(config.shard_count);
+        let mut ingresses = Vec::with_capacity(config.shard_count);
         let mut workers = Vec::with_capacity(config.shard_count);
         let runtime_epoch = NEXT_RUNTIME_EPOCH.fetch_add(1, Ordering::Relaxed);
+        let drain_batches = matches!(config.durability, Durability::LocalDurable);
         for (shard, store) in stores.into_iter().enumerate() {
             let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
             let namespace = config.namespace.clone();
+            let maintenance = Arc::new(MaintenanceCounters::default());
+            let worker_maintenance = Arc::clone(&maintenance);
             let worker = thread::Builder::new()
                 .name(format!("punah-shard-{shard:04}"))
-                .spawn(move || run_worker(store, &namespace, runtime_epoch, &receiver))
+                .spawn(move || {
+                    run_worker(
+                        store,
+                        &namespace,
+                        runtime_epoch,
+                        &receiver,
+                        drain_batches,
+                        MaintenanceScheduler::new(compaction, worker_maintenance),
+                    );
+                })
                 .map_err(OpenError::WorkerSpawn)?;
-            senders.push(sender);
+            ingresses.push(ShardIngress {
+                sender,
+                gate: Mutex::new(()),
+                maintenance,
+            });
             workers.push(worker);
         }
         Ok(Self {
             shared: Arc::new(Shared {
-                senders,
+                ingresses,
                 accepting: AtomicBool::new(true),
-                submission_gate: Mutex::new(()),
             }),
             workers,
         })
@@ -547,16 +647,22 @@ impl Runtime {
         if self.workers.is_empty() {
             return;
         }
-        if let Ok(_guard) = self.shared.submission_gate.lock() {
-            self.shared.accepting.store(false, Ordering::Release);
-            for sender in &self.shared.senders {
-                let _ = sender.send(Request::Shutdown);
-            }
+        self.shared.accepting.store(false, Ordering::Release);
+        for ingress in &self.shared.ingresses {
+            let _guard = lock_ingress(ingress);
+            let _ = ingress.sender.send(Request::Shutdown);
         }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
+}
+
+fn lock_ingress(ingress: &ShardIngress) -> MutexGuard<'_, ()> {
+    ingress
+        .gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Drop for Runtime {
@@ -588,13 +694,52 @@ fn run_worker(
     namespace: &Namespace,
     runtime_epoch: u64,
     receiver: &Receiver<Request>,
+    drain_batches: bool,
+    mut maintenance: MaintenanceScheduler,
 ) {
     let mut leases = LeaseTable::default();
     let mut next_token = 1_u64;
-    while let Ok(request) = receiver.recv() {
+    let mut deferred = None;
+    loop {
+        let request = if let Some(request) = deferred.take() {
+            request
+        } else {
+            let Ok(request) = receiver.recv() else {
+                break;
+            };
+            request
+        };
+        let mut completed_mutations = 0_u64;
         match request {
             Request::Batch { commands, reply } => {
-                execute_batch_request(&mut store, commands, &reply);
+                let (mut mutation_count, mut mutation_bytes) = batch_weight(&commands);
+                let mut batches = vec![QueuedBatch { commands, reply }];
+                while drain_batches && batches.len() < MAX_DRAINED_BATCH_MESSAGES {
+                    match receiver.try_recv() {
+                        Ok(Request::Batch { commands, reply }) => {
+                            let (next_count, next_bytes) = batch_weight(&commands);
+                            let exceeds_limit = mutation_count > 0
+                                && (mutation_count.saturating_add(next_count)
+                                    > MAX_DRAINED_MUTATIONS
+                                    || mutation_bytes.saturating_add(next_bytes)
+                                        > MAX_DRAINED_MUTATION_BYTES);
+                            if exceeds_limit {
+                                deferred = Some(Request::Batch { commands, reply });
+                                break;
+                            }
+                            mutation_count = mutation_count.saturating_add(next_count);
+                            mutation_bytes = mutation_bytes.saturating_add(next_bytes);
+                            batches.push(QueuedBatch { commands, reply });
+                        }
+                        Ok(request) => {
+                            deferred = Some(request);
+                            break;
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+                execute_batch_requests(&mut store, batches);
+                completed_mutations = u64::try_from(mutation_count).unwrap_or(u64::MAX);
             }
             Request::Get { key, reply } => {
                 let _ = reply.send(store.get(&key).map_err(RuntimeError::Store));
@@ -613,12 +758,21 @@ fn run_worker(
                 reply,
             } => {
                 let _ = reply.send(store.set(&key, value, ttl).map_err(RuntimeError::Store));
+                completed_mutations = 1;
             }
             Request::Delete { key, reply } => {
                 let _ = reply.send(store.delete(&key).map_err(RuntimeError::Store));
+                completed_mutations = 1;
             }
             Request::Cleanup { budget, reply } => {
-                let _ = reply.send(store.cleanup_expired(budget).map_err(RuntimeError::Store));
+                let result = store.cleanup_expired(budget).map_err(RuntimeError::Store);
+                if let Ok(report) = &result {
+                    completed_mutations = u64::try_from(report.tombstoned).unwrap_or(u64::MAX);
+                }
+                let _ = reply.send(result);
+            }
+            Request::StorageTelemetry { reply } => {
+                let _ = reply.send(store.io_telemetry());
             }
             Request::LeaseAcquire {
                 operation,
@@ -685,6 +839,9 @@ fn run_worker(
                             .release(namespace, &operation, token)
                             .map_err(RuntimeError::Lease)
                     });
+                if result.is_ok() {
+                    completed_mutations = 1;
+                }
                 let _ = reply.send(result);
             }
             Request::Shutdown => break,
@@ -694,38 +851,138 @@ fn run_worker(
                 let _ = release.recv();
             }
         }
+        maintenance.record_mutations(completed_mutations);
+        if maintenance.is_due() && deferred.is_none() {
+            match receiver.try_recv() {
+                Ok(request) => deferred = Some(request),
+                Err(TryRecvError::Empty) => maintenance.run_once(&mut store),
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
     }
 }
 
-fn execute_batch_request(
-    store: &mut Store,
-    commands: Vec<(usize, BatchCommand)>,
-    reply: &SyncSender<Vec<(usize, Result<BatchValue, RuntimeError>)>>,
-) {
-    let results = commands
-        .into_iter()
-        .map(|(index, command)| (index, execute_batch_command(store, command)))
-        .collect();
-    let _ = reply.send(results);
+fn batch_weight(commands: &[(usize, BatchCommand)]) -> (usize, usize) {
+    commands
+        .iter()
+        .fold((0_usize, 0_usize), |(count, bytes), (_, command)| {
+            let mutation_bytes = match command {
+                BatchCommand::Get { .. } => return (count, bytes),
+                BatchCommand::Set { key, value, .. } => key
+                    .len()
+                    .saturating_add(value.len())
+                    .saturating_add(MUTATION_RECORD_OVERHEAD_ESTIMATE),
+                BatchCommand::Delete { key } => {
+                    key.len().saturating_add(MUTATION_RECORD_OVERHEAD_ESTIMATE)
+                }
+            };
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(mutation_bytes),
+            )
+        })
 }
 
-fn execute_batch_command(
+fn execute_batch_requests(store: &mut Store, batches: Vec<QueuedBatch>) {
+    let mut replies = Vec::with_capacity(batches.len());
+    let mut results: Vec<Vec<(usize, Result<BatchValue, RuntimeError>)>> = batches
+        .iter()
+        .map(|batch| Vec::with_capacity(batch.commands.len()))
+        .collect();
+    let mut mutations = Vec::new();
+    for (batch_slot, batch) in batches.into_iter().enumerate() {
+        replies.push(batch.reply);
+        for (index, command) in batch.commands {
+            match command {
+                BatchCommand::Get { key } => {
+                    execute_mutation_run(store, &mut mutations, &mut results);
+                    results[batch_slot].push((
+                        index,
+                        store
+                            .get(&key)
+                            .map(BatchValue::Get)
+                            .map_err(RuntimeError::Store),
+                    ));
+                }
+                BatchCommand::Set { key, value, ttl } => queue_mutation(
+                    store,
+                    &mut mutations,
+                    &mut results,
+                    batch_slot,
+                    index,
+                    StoreMutation::Set {
+                        key,
+                        payload: value,
+                        ttl,
+                    },
+                ),
+                BatchCommand::Delete { key } => {
+                    queue_mutation(
+                        store,
+                        &mut mutations,
+                        &mut results,
+                        batch_slot,
+                        index,
+                        StoreMutation::Delete { key },
+                    );
+                }
+            }
+        }
+    }
+    execute_mutation_run(store, &mut mutations, &mut results);
+    for (reply, results) in replies.into_iter().zip(results) {
+        let _ = reply.send(results);
+    }
+}
+
+fn queue_mutation(
     store: &mut Store,
-    command: BatchCommand,
-) -> Result<BatchValue, RuntimeError> {
-    match command {
-        BatchCommand::Get { key } => store
-            .get(&key)
-            .map(BatchValue::Get)
-            .map_err(RuntimeError::Store),
-        BatchCommand::Set { key, value, ttl } => store
-            .set(&key, value, ttl)
-            .map(|()| BatchValue::Set)
-            .map_err(RuntimeError::Store),
-        BatchCommand::Delete { key } => store
-            .delete(&key)
-            .map(BatchValue::Delete)
-            .map_err(RuntimeError::Store),
+    mutations: &mut Vec<(usize, usize, StoreMutation)>,
+    results: &mut [Vec<(usize, Result<BatchValue, RuntimeError>)>],
+    batch_slot: usize,
+    index: usize,
+    mutation: StoreMutation,
+) {
+    match store.validate_mutation(&mutation) {
+        Ok(()) => mutations.push((batch_slot, index, mutation)),
+        Err(error) => {
+            execute_mutation_run(store, mutations, results);
+            results[batch_slot].push((index, Err(RuntimeError::Store(error))));
+        }
+    }
+}
+
+fn execute_mutation_run(
+    store: &mut Store,
+    mutations: &mut Vec<(usize, usize, StoreMutation)>,
+    results: &mut [Vec<(usize, Result<BatchValue, RuntimeError>)>],
+) {
+    if mutations.is_empty() {
+        return;
+    }
+    let run = std::mem::take(mutations);
+    let (locations, mutations): (Vec<_>, Vec<_>) = run
+        .into_iter()
+        .map(|(batch_slot, index, mutation)| ((batch_slot, index), mutation))
+        .unzip();
+    match store.mutate_batch(mutations) {
+        Ok(values) => {
+            debug_assert_eq!(locations.len(), values.len());
+            for ((batch_slot, index), value) in locations.into_iter().zip(values) {
+                let value = match value {
+                    MutationValue::Set => BatchValue::Set,
+                    MutationValue::Delete(existed) => BatchValue::Delete(existed),
+                };
+                results[batch_slot].push((index, Ok(value)));
+            }
+        }
+        Err(error) => {
+            let mut cause = Some(error);
+            for (batch_slot, index) in locations {
+                let error = cause.take().unwrap_or(StoreError::BatchAborted);
+                results[batch_slot].push((index, Err(RuntimeError::Store(error))));
+            }
+        }
     }
 }
 

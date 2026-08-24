@@ -89,6 +89,19 @@ impl FileDevice {
         self.queue.len()
     }
 
+    /// Persists file contents and the metadata required to reopen this device.
+    ///
+    /// Segment creation uses this control-plane operation before publishing a
+    /// metadata root that references the new filename. Request-path durability
+    /// continues to use queued [`IoOperation::Flush`] operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error when the backing file cannot be synchronized.
+    pub fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
     fn in_bounds(&self, offset: u64, len: usize) -> bool {
         u64::try_from(len)
             .ok()

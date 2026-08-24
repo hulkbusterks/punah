@@ -29,7 +29,7 @@ filesystem flush overhead compared with production-sized segments.
 ## Reproduction
 
 ```sh
-cargo run --release -p punah-bench -- \
+cargo run --release -p punah-bench --bin punah-bench -- \
   --mode all \
   --operations 1000 \
   --payload-sizes 64,1024 \
@@ -75,7 +75,7 @@ measured trials. Reported values below are medians selected by aggregate
 throughput; latency values come from the same trial.
 
 ```sh
-cargo run --release -p punah-bench -- \
+cargo run --release -p punah-bench --bin punah-bench -- \
   --mode shared \
   --operations 5000 \
   --payload-sizes 64,1024 \

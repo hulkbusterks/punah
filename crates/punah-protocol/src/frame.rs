@@ -80,6 +80,39 @@ pub fn encode(frame: FrameRef<'_>) -> Result<Vec<u8>, EncodeError> {
     Ok(output)
 }
 
+/// Encodes and validates only the fixed header for scatter/gather output.
+///
+/// The returned checksum covers the borrowed key and value exactly as in a
+/// contiguous frame. Callers may write the header, key, and value as separate
+/// buffers without constructing a second payload-sized allocation.
+///
+/// # Errors
+///
+/// Returns an error when a field exceeds its wire or defensive size limit.
+pub fn encode_header(frame: FrameRef<'_>) -> Result<[u8; HEADER_LEN], EncodeError> {
+    checked_len(frame)?;
+    let key_len = frame.key.len();
+    let key_len_wire = u16::try_from(key_len).map_err(|_| EncodeError::KeyTooLarge {
+        length: key_len,
+        maximum: MAX_KEY_LEN,
+    })?;
+    let value_len_wire =
+        u32::try_from(frame.value.len()).map_err(|_| EncodeError::ValueTooLarge {
+            length: frame.value.len(),
+            maximum: MAX_VALUE_LEN,
+        })?;
+    let mut header = [0_u8; HEADER_LEN];
+    header[0] = VERSION;
+    header[1] = frame.opcode as u8;
+    header[2..4].copy_from_slice(&key_len_wire.to_be_bytes());
+    header[4..8].copy_from_slice(&value_len_wire.to_be_bytes());
+    header[8..12].copy_from_slice(&checksum_parts(&[frame.key, frame.value]).to_be_bytes());
+    header[12] = frame.flags;
+    let ttl = frame.ttl.to_be_bytes();
+    header[13..16].copy_from_slice(&ttl[1..]);
+    Ok(header)
+}
+
 /// Encodes a frame into the beginning of `output`.
 ///
 /// # Errors
@@ -94,24 +127,9 @@ pub fn encode_into(frame: FrameRef<'_>, output: &mut [u8]) -> Result<usize, Enco
         });
     }
     let key_len = frame.key.len();
-    let key_len_wire = u16::try_from(key_len).map_err(|_| EncodeError::KeyTooLarge {
-        length: key_len,
-        maximum: MAX_KEY_LEN,
-    })?;
-    let value_len_wire =
-        u32::try_from(frame.value.len()).map_err(|_| EncodeError::ValueTooLarge {
-            length: frame.value.len(),
-            maximum: MAX_VALUE_LEN,
-        })?;
+    let header = encode_header(frame)?;
     let bytes = &mut output[..len];
-    bytes[0] = VERSION;
-    bytes[1] = frame.opcode as u8;
-    bytes[2..4].copy_from_slice(&key_len_wire.to_be_bytes());
-    bytes[4..8].copy_from_slice(&value_len_wire.to_be_bytes());
-    bytes[8..12].copy_from_slice(&checksum_parts(&[frame.key, frame.value]).to_be_bytes());
-    bytes[12] = frame.flags;
-    let ttl = frame.ttl.to_be_bytes();
-    bytes[13..16].copy_from_slice(&ttl[1..]);
+    bytes[..HEADER_LEN].copy_from_slice(&header);
     bytes[HEADER_LEN..HEADER_LEN + key_len].copy_from_slice(frame.key);
     bytes[HEADER_LEN + key_len..].copy_from_slice(frame.value);
     Ok(len)
@@ -300,6 +318,16 @@ mod tests {
         let mut output = [0xcc; 27];
         assert_eq!(encode_into(frame.as_ref(), &mut output).unwrap(), 24);
         assert_eq!(&output[24..], &[0xcc; 3]);
+    }
+
+    #[test]
+    fn header_encoding_matches_contiguous_encoding() {
+        let frame = sample();
+        let encoded = encode(frame.as_ref()).unwrap();
+        assert_eq!(
+            encode_header(frame.as_ref()).unwrap(),
+            encoded[..HEADER_LEN]
+        );
     }
 
     #[test]

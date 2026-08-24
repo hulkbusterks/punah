@@ -17,8 +17,9 @@ incorrect marker.
 Each slot is exactly 4096 bytes. Implementations place two slots at stable,
 independently writable locations. Recovery validates both and chooses the valid
 slot with the greatest generation; equal generations deterministically prefer
-slot A. If neither validates, normal recovery stops and a future repair scan may
-reconstruct a checkpoint from self-describing segments.
+slot A. Two complete all-zero slots mean the metadata area is pristine and may
+bootstrap legacy segment discovery. Any nonzero state with no recoverable root
+is corruption and fails closed; it is never silently treated as a fresh store.
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -38,8 +39,8 @@ reconstruct a checkpoint from self-describing segments.
 | 4092 | 4 | commit marker |
 
 A zero journal-tail pointer denotes no journal entries after the checkpoint.
-Pointer checksums allow the eventual publication layer to validate referenced
-objects before accepting a newer root.
+Pointer checksums let the publication layer validate referenced objects before
+accepting a newer root.
 
 ## Manifest checkpoint
 
@@ -94,14 +95,29 @@ Recovery does not select a root merely because its slot checksum is valid. It
 reads the entire referenced checkpoint, verifies the pointer checksum, validates
 the checkpoint codec and commit marker, and verifies that its generation equals
 the root generation. A nonzero journal-tail pointer is validated the same way.
-If any referenced object is invalid, recovery tries the older valid slot.
+If any referenced object is invalid, recovery tries the older valid slot. If
+both roots or their referenced objects are invalid, Store open returns
+`NoRecoverableRoot` before scanning segment filenames or rewriting metadata.
+
+Manifest descriptors are authoritative. Sealed entries are read only through
+their exact published `start_offset` and `logical_length`; valid-looking bytes
+beyond that boundary are ignored. The final active segment's published length
+is a strict prefix because ordinary appends do not republish the manifest. Its
+contiguous committed suffix is therefore discovered and checked separately.
 
 `publish_checkpoint` alternates slots and requires consecutive generations once
 a root exists. `append_journal` durably commits an immutable record but does not
 make it authoritative by itself; a subsequent root publication must reference
 it. The zero pointer is represented only by three zero fields.
 
-The future I/O implementation must preserve this order:
+Before publishing a checkpoint, Store makes every segment boundary newly made
+strict by that checkpoint durable. Rotation syncs the old active file before
+sealing it. Compaction syncs both its replacement and the current active prefix.
+New segment files are synced and their directory entry is synced before a root
+may reference the filename.
+
+The implemented portable publication path preserves this order, and every
+future backend must do the same:
 
 1. Write and make durable every replacement segment.
 2. Write and make durable an immutable checkpoint or journal record body.
@@ -111,5 +127,21 @@ The future I/O implementation must preserve this order:
 6. Only after the new root is recoverable may retired storage be reclaimed.
 
 Checksums detect corruption; they do not provide cryptographic authenticity.
-Generation comparisons are ordinary integer comparisons. Generation overflow
-must be rejected by the future publication state machine rather than wrapped.
+Generation comparisons are ordinary integer comparisons. Publication rejects
+generation overflow rather than wrapping it.
+
+There is one unavoidable version-1 ambiguity: deletion of `metadata.punah`, or
+destruction that restores both slots to exact zeros, is indistinguishable from
+a genuinely new metadata file. Normal Store open therefore accepts that state
+only when no segment files exist. If segments remain it returns
+`ExplicitImportRequired` without creating metadata. `punah-admin import` is the
+explicit authority-changing operation; `punah-admin repair` first quarantines
+nonzero corrupt metadata and then runs the same validated import. Neither path
+silently adopts bytes during normal recovery.
+
+A version-1 journal is an audit tail for the root that points to it. Recovery
+requires its generation to equal the superblock generation. It is not a replay
+chain: it has no predecessor pointer and its segment references do not contain
+the descriptor fences required to reconstruct rotation. Incremental checkpoints
+therefore require a version-2 metadata record and cannot be retrofitted by
+loosening version-1 recovery.
