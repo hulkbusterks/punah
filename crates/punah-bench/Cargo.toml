@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+punah-config = { path = "../punah-config" }
 punah-compaction = { path = "../punah-compaction" }
 punah-device = { path = "../punah-device" }
 punah-engine = { path = "../punah-engine" }
@@ -13,6 +14,7 @@ punah-network = { path = "../punah-network" }
 punah-protocol = { path = "../punah-protocol" }
 punah-record = { path = "../punah-record" }
 punah-runtime = { path = "../punah-runtime" }
+punah-server = { path = "../punah-server" }
 punah-store = { path = "../punah-store" }
 punah-types = { path = "../punah-types" }
 

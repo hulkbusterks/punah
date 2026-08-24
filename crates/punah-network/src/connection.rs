@@ -9,6 +9,18 @@ use crate::ConnectionError;
 // second payload-sized allocation and copy.
 const VECTORED_BODY_THRESHOLD: usize = 32 * 1024;
 
+/// Selects how a response frame is assembled for output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FrameWriteMode {
+    /// Use contiguous output below the measured crossover and vectors above it.
+    #[default]
+    Auto,
+    /// Allocate and encode one complete output buffer.
+    Contiguous,
+    /// Write the fixed header, key, and value as separate slices.
+    Vectored,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VersionedFrame {
     V1(Frame),
@@ -100,8 +112,20 @@ fn read_header(reader: &mut impl Read, header: &mut [u8; HEADER_LEN]) -> Result<
 /// Returns an encoding error for an invalid frame or an I/O error if the full
 /// frame cannot be written.
 pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), ConnectionError> {
+    write_frame_with_mode(writer, frame, FrameWriteMode::Auto)
+}
+
+/// Encodes and writes one frame with an explicit assembly strategy.
+///
+/// # Errors
+/// Returns an encoding error for invalid fields or an I/O error on write failure.
+pub fn write_frame_with_mode(
+    writer: &mut impl Write,
+    frame: &Frame,
+    mode: FrameWriteMode,
+) -> Result<(), ConnectionError> {
     let frame = frame.as_ref();
-    if frame.key.len().saturating_add(frame.value.len()) < VECTORED_BODY_THRESHOLD {
+    if !use_vectored(mode, frame.key.len().saturating_add(frame.value.len())) {
         writer.write_all(&encode(frame)?)?;
         return Ok(());
     }
@@ -147,11 +171,23 @@ pub fn write_versioned_frame(
     writer: &mut impl Write,
     frame: &VersionedFrame,
 ) -> Result<(), ConnectionError> {
+    write_versioned_frame_with_mode(writer, frame, FrameWriteMode::Auto)
+}
+
+/// Writes a versioned frame with an explicit assembly strategy.
+///
+/// # Errors
+/// Returns a codec error for invalid fields or an I/O error on write failure.
+pub fn write_versioned_frame_with_mode(
+    writer: &mut impl Write,
+    frame: &VersionedFrame,
+    mode: FrameWriteMode,
+) -> Result<(), ConnectionError> {
     match frame {
-        VersionedFrame::V1(frame) => write_frame(writer, frame)?,
+        VersionedFrame::V1(frame) => write_frame_with_mode(writer, frame, mode)?,
         VersionedFrame::V2(frame) => {
             let frame = frame.as_ref();
-            if frame.key.len().saturating_add(frame.value.len()) < VECTORED_BODY_THRESHOLD {
+            if !use_vectored(mode, frame.key.len().saturating_add(frame.value.len())) {
                 writer.write_all(&punah_protocol::v2::encode(frame)?)?;
                 return Ok(());
             }
@@ -160,6 +196,14 @@ pub fn write_versioned_frame(
         }
     }
     Ok(())
+}
+
+const fn use_vectored(mode: FrameWriteMode, body_len: usize) -> bool {
+    match mode {
+        FrameWriteMode::Auto => body_len >= VECTORED_BODY_THRESHOLD,
+        FrameWriteMode::Contiguous => false,
+        FrameWriteMode::Vectored => true,
+    }
 }
 
 fn write_parts(writer: &mut impl Write, header: &[u8], key: &[u8], value: &[u8]) -> io::Result<()> {
@@ -412,6 +456,16 @@ mod tests {
         };
         write_frame(&mut writer, &frame).unwrap();
         assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn forced_modes_produce_identical_v1_bytes() {
+        let frame = Frame::new(Opcode::Get, b"key".to_vec(), vec![9; 128]);
+        let mut contiguous = Vec::new();
+        let mut vectored = Vec::new();
+        write_frame_with_mode(&mut contiguous, &frame, FrameWriteMode::Contiguous).unwrap();
+        write_frame_with_mode(&mut vectored, &frame, FrameWriteMode::Vectored).unwrap();
+        assert_eq!(contiguous, vectored);
     }
 
     #[test]

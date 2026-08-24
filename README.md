@@ -98,14 +98,14 @@ scaling changes, not a single headline number:
 | Local-durable TCP SET, 1 KiB, 16 clients/pipeline 16 | 394 ops/s | 2,986 ops/s | 7.6x throughput |
 | Writer LocalDurable, 64 B, singleton→mean 62.5 records/cohort | 126 ops/s | 7,945 ops/s | 62.8x via flush amortization |
 | Buffered shared node, 64 B, concurrency 16, 1→2 shards | 322.6k ops/s | 439.6k ops/s | sublinear scaling, then plateau |
-| 64 KiB GET response, contiguous→vectored output | 127.3k ops/s | 136.5k ops/s | provisional; validated rerun required |
+| 32 KiB verified GET, contiguous→vectored output | 126.4k ops/s | 164.2k ops/s | +29.9%; won 5/5 paired trials |
 
 These are regression anchors, not Linux or kernel-bypass claims. The recovery
 path is consistent with flat cost across preallocated capacity,
 local durability amortizes two flushes across bounded cohorts, and runtime
-admission is per-shard rather than globally locked. Scatter/gather is currently
-enabled only for bodies of at least 32 KiB; its preliminary development result
-is a threshold hypothesis, not yet a firm performance claim.
+admission is per-shard rather than globally locked. A controlled five-trial
+server A/B validates the 32 KiB scatter/gather crossover; smaller bodies retain
+the contiguous path.
 
 The complete decisions, trial values, caveats, and commands are preserved in
 the [August 2026 optimization log](docs/optimization-log-2026-08.md). The

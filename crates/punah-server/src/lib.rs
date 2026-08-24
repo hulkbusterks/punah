@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use punah_config::{Config, StorageDurability, ValidationErrors};
 use punah_network::{
-    BoxError, Server, ServerConfig, StopHandle, VersionedFrame, VersionedRequestHandler,
+    BoxError, FrameWriteMode, Server, ServerConfig, StopHandle, VersionedFrame,
+    VersionedRequestHandler,
 };
 use punah_runtime::{OpenError, Runtime, RuntimeConfig};
 use punah_service::{RequestLimits, RuntimeService};
@@ -46,6 +47,17 @@ impl Node {
     /// # Errors
     /// Returns configuration, namespace, storage, or socket setup failures.
     pub fn bind(config: Config) -> Result<Self, NodeError> {
+        Self::bind_with_write_mode(config, FrameWriteMode::Auto)
+    }
+
+    /// Binds a node with an explicit response assembly mode for controlled A/B tests.
+    ///
+    /// # Errors
+    /// Returns configuration, namespace, storage, or socket setup failures.
+    pub fn bind_with_write_mode(
+        config: Config,
+        write_mode: FrameWriteMode,
+    ) -> Result<Self, NodeError> {
         config.validate().map_err(NodeError::InvalidConfig)?;
         let limits = RequestLimits {
             max_key_bytes: usize::try_from(config.limits.max_key_bytes)
@@ -75,6 +87,7 @@ impl Node {
                 read_timeout: config.tcp.read_timeout,
                 write_timeout: config.tcp.write_timeout,
                 accept_poll_interval: Duration::from_millis(5),
+                write_mode,
             },
         )
         .map_err(NodeError::Io)?;

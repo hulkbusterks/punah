@@ -11,9 +11,11 @@ use std::{
 
 use punah_protocol::Frame;
 
+#[cfg(test)]
+use crate::write_frame;
 use crate::{
-    BoxError, ConnectionError, VersionedFrame, read_frame, read_versioned_frame, write_frame,
-    write_versioned_frame,
+    BoxError, ConnectionError, FrameWriteMode, VersionedFrame, read_frame, read_versioned_frame,
+    write_frame_with_mode, write_versioned_frame_with_mode,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +24,7 @@ pub struct ServerConfig {
     pub read_timeout: Duration,
     pub write_timeout: Duration,
     pub accept_poll_interval: Duration,
+    pub write_mode: FrameWriteMode,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +34,7 @@ impl Default for ServerConfig {
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             accept_poll_interval: Duration::from_millis(10),
+            write_mode: FrameWriteMode::Auto,
         }
     }
 }
@@ -279,7 +283,7 @@ fn serve_connection<H: RequestHandler>(
     stream.set_write_timeout(Some(config.write_timeout))?;
     while let Some(request) = read_frame(&mut stream)? {
         let response = handler.handle(request).map_err(ConnectionError::Handler)?;
-        write_frame(&mut stream, &response)?;
+        write_frame_with_mode(&mut stream, &response, config.write_mode)?;
     }
     Ok(())
 }
@@ -315,7 +319,7 @@ fn serve_versioned_connection<H: VersionedRequestHandler>(
             ))));
         }
         for response in &responses {
-            write_versioned_frame(reader.get_mut(), response)?;
+            write_versioned_frame_with_mode(reader.get_mut(), response, config.write_mode)?;
         }
     }
     Ok(())

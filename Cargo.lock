@@ -120,6 +120,7 @@ name = "punah-bench"
 version = "0.1.0"
 dependencies = [
  "punah-compaction",
+ "punah-config",
  "punah-device",
  "punah-engine",
  "punah-metadata",
@@ -127,6 +128,7 @@ dependencies = [
  "punah-protocol",
  "punah-record",
  "punah-runtime",
+ "punah-server",
  "punah-store",
  "punah-types",
 ]

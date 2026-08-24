@@ -77,6 +77,16 @@ configured and achieved reclaim ratios, foreground encoded bytes, logical
 write amplification, maximum per-cycle input/output, retained logical and
 allocated segment bytes, and verified hot-cache reopen time.
 
+Response assembly has an in-process A/B harness that keeps one executable and
+client implementation, changes only `ServerConfig` between forced contiguous
+and vectored output, alternates order, preloads outside timing, validates every
+response byte, and uses a fresh Store per case:
+
+```sh
+cargo run --release --locked -p punah-bench --bin tcp_output_compare -- \
+  100000 16384,32768,65536 16 16 1024 5
+```
+
 Hosted CI compiles benchmark code but does not gate throughput. Development
 results and decisions are recorded in the
 [August 2026 optimization log](optimization-log-2026-08.md); production claims

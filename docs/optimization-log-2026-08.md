@@ -111,18 +111,27 @@ retire a segment during network output. The response path can still avoid the
 second payload-sized copy by checksumming a fixed header and using vectored
 writes. A fixed pre-change client binary isolated the server-side change.
 
-Always using vectors regressed the 1 KiB median by roughly 2.5%, and 16 KiB was
-also worse. At 32 KiB results were effectively neutral; at 64 KiB the observed
-medians were 127,294 and 136,541 ops/s. Those three-trial ranges were noisy and
-the old client did not prove every GET was a seeded hit, so 7.3% is provisional.
-The 32 KiB switch remains a conservative threshold hypothesis. The checked-in
-client now preloads the complete requested GET keyspace and validates opcode,
-key, length, and every value byte before accepting a sample; the comparison
-must be rerun before promoting this to a firm win. It also reads into a reusable
-`FrameBuffer` and validates borrowed key/value slices, removing the old
-per-response full-buffer plus owned key/value allocation from the client. True
-mmap-to-socket borrowing remains gated on read leases and deferred segment
-retirement.
+The old three-trial comparison was noisy and its client did not prove every GET
+was a seeded hit. The checked-in client now validates opcode, key, length, and
+every payload byte with a reusable borrowed `FrameBuffer`. A new integrated A/B
+goes further: the same executable starts fresh in-process nodes, changes only
+`ServerConfig` between forced contiguous and vectored responses, preloads
+outside timing, alternates order, and validates every response.
+
+At 100,000 verified GETs, 16 clients, pipeline 16, 1,024 hot keys, and five
+trials, the throughput observations were:
+
+| Payload | Contiguous trials (ops/s) | Vectored trials (ops/s) | Median result |
+|---:|---|---|---:|
+| 16 KiB | 213869, 222697, 235344, 169872, 94842 | 211055, 241123, 212504, 235050, 191876 | 212.5k vs 213.9k; -0.6% |
+| 32 KiB | 145945, 106562, 126384, 127413, 62093 | 166455, 164159, 144794, 169885, 94436 | 164.2k vs 126.4k; +29.9% |
+| 64 KiB | 65824, 78157, 82256, 59060, 80477 | 85202, 76226, 95430, 62771, 84968 | 85.0k vs 78.2k; +8.7% |
+
+The environment remained noisy, but vectors won all five paired 32 KiB trials
+and four of five at 64 KiB; 16 KiB was effectively neutral at the median. The
+32 KiB automatic threshold is therefore retained with direct evidence rather
+than a hypothesis. True mmap-to-socket borrowing remains gated on read leases
+and deferred segment retirement.
 
 ### First background-compaction churn smoke test
 
@@ -230,6 +239,13 @@ The TCP comparison client accepts:
 target/release/tcp_compare ADDRESS get|set|mixed OPS PAYLOAD CLIENTS PIPELINE KEY_SPACE PRELOAD_KEYS
 ```
 
+The controlled response-output crossover is:
+
+```sh
+cargo run --release --locked -p punah-bench --bin tcp_output_compare -- \
+  100000 16384,32768,65536 16 16 1024 5
+```
+
 For server-side response comparisons, keep the client binary fixed; rebuilding
 it after a protocol/network optimization can change client allocations and hide
 or exaggerate the server effect. Restore the same pristine prepared snapshot for
@@ -241,7 +257,6 @@ durability, and take at least five trials.
 Runtime auto-drain now has an end-to-end Store-backed cohort curve with actual
 record, byte, group, and Flush telemetry, and compaction now has hot-only plus
 mixed hot/cold reclaim-yield curves. The next portable measurements should
-cover validated TCP GET A/B trials with the repaired client and CPU plus
-page-fault counters. Linux work should run the checked-in ordinary-file versus
+cover CPU plus page-fault counters. Linux work should run the checked-in ordinary-file versus
 `io_uring` baseline before specialized SPDK or DPDK hardware is allowed to
 obscure algorithmic costs.
