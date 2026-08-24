@@ -66,6 +66,23 @@ cargo run --release --locked -p punah-bench --bin uring_compare -- \
   30000 1024 64 64 5
 ```
 
+An optional final selector (`both`, `file`, or `uring`) isolates one backend for
+Linux hardware counters. Build once, then run matched processes rather than
+including compilation in the sample:
+
+```sh
+cargo build --release --locked -p punah-bench --bin uring_compare
+perf stat -r 5 -e task-clock,cycles,instructions,minor-faults,major-faults -- \
+  target/release/uring_compare 30000 1024 64 64 1 file
+perf stat -r 5 -e task-clock,cycles,instructions,minor-faults,major-faults -- \
+  target/release/uring_compare 30000 1024 64 64 1 uring
+```
+
+These process counters include record construction and file setup in addition
+to the writer interval reported in CSV. They are useful only as matched backend
+deltas. Device topology, filesystem, kernel, CPU affinity, and cache policy must
+be recorded with any published result.
+
 Run it on disclosed Linux kernel/filesystem/hardware. The binary returns an
 explicit unsupported error on other platforms; this repository records no
 `io_uring` performance number from macOS.

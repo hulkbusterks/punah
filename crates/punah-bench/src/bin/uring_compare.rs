@@ -30,13 +30,8 @@ mod linux {
         let config = Config::parse(&arguments)?;
         println!("{CSV_HEADER}");
         for trial in 1..=config.trials {
-            let backends = if trial % 2 == 0 {
-                [Backend::Uring, Backend::File]
-            } else {
-                [Backend::File, Backend::Uring]
-            };
             let mut rows = Vec::new();
-            for backend in backends {
+            for &backend in config.backends(trial) {
                 rows.push(run_case(&config, backend, trial)?);
             }
             rows.sort_by_key(|row| row.backend);
@@ -53,11 +48,12 @@ mod linux {
         batch_size: usize,
         queue_depth: usize,
         trials: usize,
+        backend: BackendSelection,
     }
 
     impl Config {
         fn parse(arguments: &[String]) -> Result<Self, String> {
-            if !(4..=5).contains(&arguments.len()) {
+            if !(4..=6).contains(&arguments.len()) {
                 return Err(usage());
             }
             let operations = nonzero(&arguments[0], "OPERATIONS")?;
@@ -69,6 +65,11 @@ mod linux {
             let trials = arguments
                 .get(4)
                 .map_or(Ok(5), |value| nonzero(value, "TRIALS"))?;
+            let backend = arguments
+                .get(5)
+                .map_or(Ok(BackendSelection::Both), |value| {
+                    BackendSelection::parse(value)
+                })?;
             if batch_size > 64 {
                 return Err("BATCH_SIZE cannot exceed 64".to_owned());
             }
@@ -78,7 +79,21 @@ mod linux {
                 batch_size,
                 queue_depth,
                 trials,
+                backend,
             })
+        }
+
+        fn backends(&self, trial: usize) -> &'static [Backend] {
+            const FILE: &[Backend] = &[Backend::File];
+            const URING: &[Backend] = &[Backend::Uring];
+            const FILE_FIRST: &[Backend] = &[Backend::File, Backend::Uring];
+            const URING_FIRST: &[Backend] = &[Backend::Uring, Backend::File];
+            match self.backend {
+                BackendSelection::File => FILE,
+                BackendSelection::Uring => URING,
+                BackendSelection::Both if trial.is_multiple_of(2) => URING_FIRST,
+                BackendSelection::Both => FILE_FIRST,
+            }
         }
     }
 
@@ -93,13 +108,32 @@ mod linux {
     }
 
     fn usage() -> String {
-        "usage: uring_compare OPERATIONS PAYLOAD_BYTES BATCH_SIZE QUEUE_DEPTH [TRIALS=5]".to_owned()
+        "usage: uring_compare OPERATIONS PAYLOAD_BYTES BATCH_SIZE QUEUE_DEPTH [TRIALS=5] [BACKEND=both]"
+            .to_owned()
     }
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     enum Backend {
         File,
         Uring,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BackendSelection {
+        Both,
+        File,
+        Uring,
+    }
+
+    impl BackendSelection {
+        fn parse(value: &str) -> Result<Self, String> {
+            match value {
+                "both" => Ok(Self::Both),
+                "file" => Ok(Self::File),
+                "uring" | "io_uring" => Ok(Self::Uring),
+                _ => Err("BACKEND must be both, file, or uring".to_owned()),
+            }
+        }
     }
 
     impl Backend {
@@ -267,4 +301,20 @@ mod linux {
     }
 
     use std::collections::VecDeque;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parser_selects_one_backend_for_external_counters() {
+            let arguments = ["20", "256", "4", "8", "1", "file"].map(str::to_owned);
+            let config = Config::parse(&arguments).expect("configuration");
+            assert_eq!(config.backends(1), &[Backend::File]);
+
+            let mut invalid = arguments;
+            invalid[5] = "unknown".to_owned();
+            assert!(Config::parse(&invalid).is_err());
+        }
+    }
 }

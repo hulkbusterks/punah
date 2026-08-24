@@ -22,12 +22,7 @@ fn main() -> Result<(), String> {
     println!("{CSV_HEADER}");
     for trial in 1..=config.trials {
         for &payload in &config.payloads {
-            let modes = if trial % 2 == 0 {
-                [FrameWriteMode::Vectored, FrameWriteMode::Contiguous]
-            } else {
-                [FrameWriteMode::Contiguous, FrameWriteMode::Vectored]
-            };
-            for mode in modes {
+            for &mode in config.write_modes(trial) {
                 println!("{}", run_case(&config, payload, mode, trial)?.csv());
             }
         }
@@ -42,13 +37,14 @@ struct BenchConfig {
     pipeline: usize,
     key_space: usize,
     trials: usize,
+    mode: ModeSelection,
 }
 
 impl BenchConfig {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        if arguments.len() != 6 {
+        if !(6..=7).contains(&arguments.len()) {
             return Err(
-                "usage: tcp_output_compare OPERATIONS PAYLOADS CLIENTS PIPELINE KEY_SPACE TRIALS"
+                "usage: tcp_output_compare OPERATIONS PAYLOADS CLIENTS PIPELINE KEY_SPACE TRIALS [MODE=both]"
                     .to_owned(),
             );
         }
@@ -59,7 +55,43 @@ impl BenchConfig {
             pipeline: nonzero(&arguments[3], "PIPELINE")?,
             key_space: nonzero(&arguments[4], "KEY_SPACE")?,
             trials: nonzero(&arguments[5], "TRIALS")?,
+            mode: arguments
+                .get(6)
+                .map_or(Ok(ModeSelection::Both), |mode| ModeSelection::parse(mode))?,
         })
+    }
+
+    fn write_modes(&self, trial: usize) -> &'static [FrameWriteMode] {
+        const CONTIGUOUS: &[FrameWriteMode] = &[FrameWriteMode::Contiguous];
+        const VECTORED: &[FrameWriteMode] = &[FrameWriteMode::Vectored];
+        const CONTIGUOUS_FIRST: &[FrameWriteMode] =
+            &[FrameWriteMode::Contiguous, FrameWriteMode::Vectored];
+        const VECTORED_FIRST: &[FrameWriteMode] =
+            &[FrameWriteMode::Vectored, FrameWriteMode::Contiguous];
+        match self.mode {
+            ModeSelection::Contiguous => CONTIGUOUS,
+            ModeSelection::Vectored => VECTORED,
+            ModeSelection::Both if trial.is_multiple_of(2) => VECTORED_FIRST,
+            ModeSelection::Both => CONTIGUOUS_FIRST,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeSelection {
+    Both,
+    Contiguous,
+    Vectored,
+}
+
+impl ModeSelection {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "both" => Ok(Self::Both),
+            "contiguous" => Ok(Self::Contiguous),
+            "vectored" => Ok(Self::Vectored),
+            _ => Err("MODE must be both, contiguous, or vectored".to_owned()),
+        }
     }
 }
 
@@ -320,10 +352,22 @@ mod tests {
             pipeline: 2,
             key_space: 4,
             trials: 1,
+            mode: ModeSelection::Both,
         };
         for mode in [FrameWriteMode::Contiguous, FrameWriteMode::Vectored] {
             let row = run_case(&config, 256, mode, 1).expect("case");
             assert_eq!(row.csv().split(',').count(), CSV_HEADER.split(',').count());
         }
+    }
+
+    #[test]
+    fn parser_selects_one_mode_for_external_counters() {
+        let arguments = ["20", "256", "2", "2", "4", "1", "vectored"].map(str::to_owned);
+        let config = BenchConfig::parse(&arguments).expect("configuration");
+        assert_eq!(config.write_modes(1), &[FrameWriteMode::Vectored]);
+
+        let mut invalid = arguments;
+        invalid[6] = "unknown".to_owned();
+        assert!(BenchConfig::parse(&invalid).is_err());
     }
 }

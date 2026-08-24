@@ -133,6 +133,18 @@ and four of five at 64 KiB; 16 KiB was effectively neutral at the median. The
 than a hypothesis. True mmap-to-socket borrowing remains gated on read leases
 and deferred segment retirement.
 
+A later external-counter sanity run isolated one mode per process on the Apple
+M4. Each process ran three fresh 100,000-GET, 32 KiB cases with the same 16
+clients, pipeline 16, and 1,024-key fixture. Contiguous throughput observations
+were 165.4k, 147.4k, and 151.6k ops/s; vectored observations were 175.0k,
+186.6k, and 174.6k ops/s, a +15.5% median delta. Whole-process macOS accounting
+reported 99.87 billion versus 95.51 billion instructions (-4.4%), 40.01 billion
+versus 37.63 billion cycles (-6.0%), 8,057 versus 7,837 page reclaims, and zero
+major page faults for both. Those counters include startup, preload, and
+teardown and the two processes were not interleaved, so they support the
+direction but do not replace the paired hot-interval A/B or the pending Linux
+`perf stat` run.
+
 ### First background-compaction churn smoke test
 
 The checked-in `compaction_churn` binary now alternates disabled/background
@@ -256,7 +268,9 @@ durability, and take at least five trials.
 
 Runtime auto-drain now has an end-to-end Store-backed cohort curve with actual
 record, byte, group, and Flush telemetry, and compaction now has hot-only plus
-mixed hot/cold reclaim-yield curves. The next portable measurements should
-cover CPU plus page-fault counters. Linux work should run the checked-in ordinary-file versus
-`io_uring` baseline before specialized SPDK or DPDK hardware is allowed to
-obscure algorithmic costs.
+mixed hot/cold reclaim-yield curves. The response and Linux storage A/B runners
+now accept a single-mode/backend selector so external `perf stat` runs can
+capture CPU and page-fault deltas without unsafe counter FFI. Those counters are
+still awaiting a disclosed Linux run. Linux work should run the checked-in
+ordinary-file versus `io_uring` baseline before specialized SPDK or DPDK
+hardware is allowed to obscure algorithmic costs.

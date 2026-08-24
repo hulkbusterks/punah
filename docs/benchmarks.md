@@ -87,6 +87,24 @@ cargo run --release --locked -p punah-bench --bin tcp_output_compare -- \
   100000 16384,32768,65536 16 16 1024 5
 ```
 
+The optional final selector is `both`, `contiguous`, or `vectored`. It exists so
+one response path can be measured as one OS process without adding unsafe
+platform-counter FFI to the benchmark crate. On Linux, build once and collect
+CPU plus fault counters for each path independently:
+
+```sh
+cargo build --release --locked -p punah-bench --bin tcp_output_compare
+perf stat -r 5 -e task-clock,cycles,instructions,minor-faults,major-faults -- \
+  target/release/tcp_output_compare 100000 32768 16 16 1024 1 contiguous
+perf stat -r 5 -e task-clock,cycles,instructions,minor-faults,major-faults -- \
+  target/release/tcp_output_compare 100000 32768 16 16 1024 1 vectored
+```
+
+The CSV elapsed time excludes node startup and preload; external process
+counters necessarily include them. Compare counter deltas only between matched
+fresh cases, alternate which mode runs first, retain every observation, and do
+not present the counters as hot-phase-only values.
+
 Hosted CI compiles benchmark code but does not gate throughput. Development
 results and decisions are recorded in the
 [August 2026 optimization log](optimization-log-2026-08.md); production claims
