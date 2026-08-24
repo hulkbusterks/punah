@@ -703,6 +703,15 @@ fn run_worker(
     loop {
         let request = if let Some(request) = deferred.take() {
             request
+        } else if maintenance.has_active_compaction() {
+            match receiver.try_recv() {
+                Ok(request) => request,
+                Err(TryRecvError::Empty) => {
+                    maintenance.run_once(&mut store);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
         } else {
             let Ok(request) = receiver.recv() else {
                 break;

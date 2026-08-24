@@ -316,17 +316,23 @@ The portable reference milestone is implemented:
 - Recovery, tombstone fencing, stale-copy rejection, manifest-orphan handling,
   restart, and low-headroom behavior have deterministic tests.
 
-The reference compactor is intentionally synchronous under one exclusive Store
-borrow. GET copies its payload before returning, so no mapping borrow or reader
-lease can outlive that borrow; removal is quiescent without a separate epoch
-system. Background or zero-copy reads will require reference-counted read leases
-and deferred reclamation before they are allowed to overlap compaction.
+The Store exposes an explicit single-owner compaction state machine. It scans at
+most 64 records and 1 MiB of input per default copy slice, durably appends the
+live subset as one cohort, and permits foreground work between slices. Exact
+`(key, sequence, old_location)` relocation checks make a copy that became stale
+between slices harmless. Durable-output readiness and root publication are
+separate states, preserving the tested orphan-output crash window. GET copies
+its payload before returning, so no mapping borrow or reader lease outlives a
+Store call; removal remains quiescent without a separate epoch system. Dropping
+a job during graceful shutdown removes and directory-syncs its private output;
+only an actual crash can leave the intentionally ignored orphan behind.
 
 Remaining production work is policy and acceleration rather than the original
 location-backed correctness skeleton:
 
-1. split synchronous compaction into resumable copy slices so its currently
-   observed pause budget can become a hard preemption bound;
+1. move active-file and metadata durability barriers off the foreground owner,
+   with a captured active-prefix fence and layout-epoch validation, before
+   claiming a hard publication-pause bound;
 2. design a version-2 predecessor-linked topology journal if checkpoint
    benchmarks show full manifests are materially expensive; journal v1 is an
    audit tail and cannot reconstruct descriptor fences;
@@ -340,12 +346,13 @@ location-backed correctness skeleton:
 
 Implemented maintenance now includes authoritative per-segment live/dead byte
 accounting, an opt-in shard-local scheduler that runs only after a mutation
-threshold and an observed-empty ingress, hard input/output byte limits, and
-per-shard pause/reclamation/failure counters, including peak input and copied
-bytes. Latest expired values and tombstones remain live until bounded cleanup
-writes a superseding tombstone. The synchronous compactor always finishes an
-accepted plan, so `pause_budget` is explicitly telemetry/a target rather than a
-false cancellation guarantee.
+threshold and an observed-empty ingress, hard input/output byte limits,
+resumable copy slices, and per-shard pause/reclamation/failure counters,
+including actual state-machine steps and peak input/copied bytes. Latest
+expired values and tombstones remain live until bounded cleanup writes a
+superseding tombstone. Foreground work preempts between copy slices, but
+`pause_budget` remains telemetry/a target for synchronous preparation and
+publication barriers rather than a false hard guarantee.
 
 Operator recovery is also explicit. `punah-admin inspect` is read-only,
 `import` validates unmanaged committed prefixes before publishing authority,

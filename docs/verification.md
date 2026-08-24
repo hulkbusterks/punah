@@ -48,7 +48,13 @@ boundaries, compaction, and corrupt-root handling. They now explicitly exercise
 the two namespace/publication sides of rotation and compaction: a durable new
 segment before root publication remains an orphan and is never reused, while a
 new compaction root before old-input deletion recovers only replacement
-membership. These real-file states complement rather than overclaim the
+membership. Resumable-compaction coverage also copies a live record, performs a
+new foreground overwrite between slices, publishes the replacement, and
+reopens to prove the exact relocation fence cannot redirect the newer version.
+Graceful job cancellation is separately checked to remove its private output,
+while the crash-window test deliberately skips destructors and retains it as an
+orphan under the old root.
+These real-file states complement rather than overclaim the
 two-image byte model. Injecting `CrashDevice` below the complete Store still
 requires separating filesystem namespace/metadata authority from Store's
 current concrete `FileDevice`; torn sectors and real filesystem crash ordering

@@ -206,6 +206,23 @@ root, and directory publication must be redesigned or moved behind a stronger
 availability mechanism. Verified hot-cache reopen remained below 0.5 ms in
 these final trials.
 
+Compaction was then split into an explicit Store state machine: bounded input
+copy, durable-output readiness, and authority publication. The default copy
+slice scans at most 64 records/1 MiB and appends its live subset as one durable
+cohort. Runtime gives queued foreground requests priority between slices. An
+exact relocation-fence test overwrites a record after its copy slice and proves
+that publication cannot redirect the newer foreground version.
+
+The matched 75%-reclaim mixed rerun produced two copy slices, one output
+preparation, and one publication step per completed compaction. Background
+throughput observations were 116.05, 116.95, and 117.56 ops/s versus disabled
+120.48, 119.32, and 121.24 ops/s; medians were 116.95 and 120.48 (-2.9%). Max
+individual owner-step pauses were 28.17, 28.17, and 27.96 ms, down from the
+earlier 104–107 ms whole-compaction pauses. Exactly one of four steps per trial
+exceeded 25 ms. Copy work is therefore preemptible and no longer the
+tail-latency driver; synchronous active-file/root/directory publication is the
+measured remaining floor.
+
 ## Reproduction shapes
 
 The shared-node sweep is available directly from the checked-in harness:

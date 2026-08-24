@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use punah_compaction::{PlanningError, PlanningLimits};
-use punah_store::Store;
+use punah_store::{CompactionJob, CompactionProgress, CompactionSliceBudget, Store};
 
 const DEFAULT_MINIMUM_RECLAIM_RATIO_BPS: u16 = 7_500;
 const DEFAULT_MINIMUM_INPUT_SEGMENTS: usize = 2;
@@ -14,9 +14,10 @@ const DEFAULT_MINIMUM_INPUT_SEGMENTS: usize = 2;
 ///
 /// A cycle is considered only after `check_every_mutations` accepted mutations
 /// and only while the owning shard's ingress is observed empty. Input and
-/// temporary-output bytes are hard planning bounds. `pause_budget` is an
-/// observable target: the current synchronous compactor finishes an accepted
-/// plan rather than interrupting publication halfway through.
+/// temporary-output bytes are hard planning bounds. Copying advances in
+/// 64-record/1-MiB slices and foreground work can preempt between them.
+/// `pause_budget` remains an observable target because durable-output setup and
+/// authority publication are indivisible synchronous steps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackgroundCompaction {
     Disabled,
@@ -125,6 +126,10 @@ pub struct MaintenanceSnapshot {
     pub shard: usize,
     pub checks: u64,
     pub compactions: u64,
+    /// Owner-thread maintenance state-machine advances, including publication.
+    pub steps: u64,
+    pub copy_slices: u64,
+    pub output_preparations: u64,
     pub input_bytes: u64,
     pub copied_bytes: u64,
     pub max_input_bytes: u64,
@@ -141,6 +146,9 @@ pub struct MaintenanceSnapshot {
 pub(crate) struct MaintenanceCounters {
     checks: AtomicU64,
     compactions: AtomicU64,
+    steps: AtomicU64,
+    copy_slices: AtomicU64,
+    output_preparations: AtomicU64,
     input_bytes: AtomicU64,
     copied_bytes: AtomicU64,
     max_input_bytes: AtomicU64,
@@ -162,6 +170,9 @@ impl MaintenanceCounters {
             shard,
             checks: self.checks.load(Ordering::Relaxed),
             compactions,
+            steps: self.steps.load(Ordering::Relaxed),
+            copy_slices: self.copy_slices.load(Ordering::Relaxed),
+            output_preparations: self.output_preparations.load(Ordering::Relaxed),
             input_bytes: self.input_bytes.load(Ordering::Relaxed),
             copied_bytes: self.copied_bytes.load(Ordering::Relaxed),
             max_input_bytes: self.max_input_bytes.load(Ordering::Relaxed),
@@ -180,6 +191,13 @@ pub(crate) struct MaintenanceScheduler {
     policy: BackgroundCompaction,
     mutations_since_check: u64,
     counters: Arc<MaintenanceCounters>,
+    active: Option<ActiveCompaction>,
+}
+
+struct ActiveCompaction {
+    job: CompactionJob,
+    input_bytes: u64,
+    reclaimable_bytes: u64,
 }
 
 impl MaintenanceScheduler {
@@ -188,6 +206,7 @@ impl MaintenanceScheduler {
             policy,
             mutations_since_check: 0,
             counters,
+            active: None,
         }
     }
 
@@ -196,6 +215,9 @@ impl MaintenanceScheduler {
     }
 
     pub(crate) fn is_due(&self) -> bool {
+        if self.active.is_some() {
+            return true;
+        }
         match self.policy {
             BackgroundCompaction::Disabled => false,
             BackgroundCompaction::Enabled {
@@ -203,6 +225,10 @@ impl MaintenanceScheduler {
                 ..
             } => self.mutations_since_check >= check_every_mutations,
         }
+    }
+
+    pub(crate) const fn has_active_compaction(&self) -> bool {
+        self.active.is_some()
     }
 
     pub(crate) fn run_once(&mut self, store: &mut Store) {
@@ -219,33 +245,28 @@ impl MaintenanceScheduler {
         else {
             return;
         };
-        self.mutations_since_check = 0;
-        self.counters.checks.fetch_add(1, Ordering::Relaxed);
-        let plan = match store.plan_compaction(PlanningLimits {
-            available_bytes: temporary_output_budget_bytes,
-            emergency_reserve_bytes,
-            max_input_bytes,
-            output_safety_margin_bytes,
-            minimum_reclaim_ratio_bps,
-            minimum_input_segments,
-        }) {
-            Ok(plan) => plan,
-            Err(PlanningError::NoEligibleSegments) => return,
-            Err(
-                PlanningError::NoCompactionHeadroom { .. }
-                | PlanningError::ArithmeticOverflow
-                | PlanningError::InvalidMinimumReclaimRatio(_)
-                | PlanningError::InvalidMinimumInputSegments,
-            ) => {
-                self.counters
-                    .planning_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-
         let started = Instant::now();
-        let result = store.compact(&plan);
+        if self.active.is_none()
+            && !self.start_compaction(
+                store,
+                PlanningLimits {
+                    available_bytes: temporary_output_budget_bytes,
+                    emergency_reserve_bytes,
+                    max_input_bytes,
+                    output_safety_margin_bytes,
+                    minimum_reclaim_ratio_bps,
+                    minimum_input_segments,
+                },
+            )
+        {
+            return;
+        }
+
+        let result = store.advance_compaction(
+            &mut self.active.as_mut().expect("job was installed").job,
+            CompactionSliceBudget::DEFAULT,
+        );
+        self.counters.steps.fetch_add(1, Ordering::Relaxed);
         let elapsed = started.elapsed();
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         self.counters
@@ -260,29 +281,72 @@ impl MaintenanceScheduler {
                 .fetch_add(1, Ordering::Relaxed);
         }
         match result {
-            Ok(report) => {
+            Ok(CompactionProgress::Complete(report)) => {
+                let completed = self.active.take().expect("completed job remains installed");
                 self.counters
                     .input_bytes
-                    .fetch_add(plan.input_bytes, Ordering::Relaxed);
+                    .fetch_add(completed.input_bytes, Ordering::Relaxed);
                 self.counters
                     .copied_bytes
                     .fetch_add(report.copied_bytes, Ordering::Relaxed);
                 self.counters
                     .max_input_bytes
-                    .fetch_max(plan.input_bytes, Ordering::Relaxed);
+                    .fetch_max(completed.input_bytes, Ordering::Relaxed);
                 self.counters
                     .max_copied_bytes
                     .fetch_max(report.copied_bytes, Ordering::Relaxed);
                 self.counters
                     .reclaimable_bytes
-                    .fetch_add(plan.reclaimable_bytes, Ordering::Relaxed);
+                    .fetch_add(completed.reclaimable_bytes, Ordering::Relaxed);
                 self.counters.compactions.fetch_add(1, Ordering::Release);
             }
+            Ok(CompactionProgress::Copying { .. }) => {
+                self.counters.copy_slices.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(CompactionProgress::ReadyToPublish) => {
+                self.counters
+                    .output_preparations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Err(_) => {
+                self.active = None;
                 self.counters
                     .compaction_failures
                     .fetch_add(1, Ordering::Release);
             }
+        }
+    }
+
+    fn start_compaction(&mut self, store: &mut Store, limits: PlanningLimits) -> bool {
+        self.mutations_since_check = 0;
+        self.counters.checks.fetch_add(1, Ordering::Relaxed);
+        let plan = match store.plan_compaction(limits) {
+            Ok(plan) => plan,
+            Err(PlanningError::NoEligibleSegments) => return false,
+            Err(
+                PlanningError::NoCompactionHeadroom { .. }
+                | PlanningError::ArithmeticOverflow
+                | PlanningError::InvalidMinimumReclaimRatio(_)
+                | PlanningError::InvalidMinimumInputSegments,
+            ) => {
+                self.counters
+                    .planning_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+        if let Ok(job) = store.begin_compaction(&plan) {
+            self.active = Some(ActiveCompaction {
+                job,
+                input_bytes: plan.input_bytes,
+                reclaimable_bytes: plan.reclaimable_bytes,
+            });
+            true
+        } else {
+            self.counters
+                .compaction_failures
+                .fetch_add(1, Ordering::Release);
+            false
         }
     }
 }

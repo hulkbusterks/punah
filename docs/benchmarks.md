@@ -75,7 +75,10 @@ The final two arguments model one never-overwritten persistent key every eight
 writes and require two partial inputs per replacement. CSV includes the
 configured and achieved reclaim ratios, foreground encoded bytes, logical
 write amplification, maximum per-cycle input/output, retained logical and
-allocated segment bytes, and verified hot-cache reopen time.
+allocated segment bytes, verified hot-cache reopen time, and actual maintenance
+steps, copy slices, and durable-output preparations. `max_pause_ns` is the
+largest individual owner-thread step, not the full wall time of a multi-slice
+compaction.
 
 Response assembly has an in-process A/B harness that keeps one executable and
 client implementation, changes only `ServerConfig` between forced contiguous

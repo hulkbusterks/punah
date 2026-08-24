@@ -9,7 +9,7 @@ use punah_runtime::{BackgroundCompaction, MaintenanceSnapshot, Runtime, RuntimeC
 use punah_store::StoreIoTelemetry;
 use punah_types::{Durability, Namespace};
 
-const CSV_HEADER: &str = "strategy,operations,value_bytes,key_space,persistent_every,segment_bytes,minimum_reclaim_ratio_bps,minimum_input_segments,pause_budget_ns,trial,elapsed_ns,ops_per_second,set_p50_ns,set_p95_ns,set_p99_ns,set_p999_ns,foreground_encoded_bytes,logical_write_amplification,checks,compactions,input_bytes,copied_bytes,reclaimable_bytes,actual_reclaim_ratio_bps,max_input_bytes,max_copied_bytes,planning_failures,compaction_failures,pause_budget_exceeded,max_pause_ns,retained_segment_files,retained_segment_bytes,retained_allocated_bytes,recovery_ns";
+const CSV_HEADER: &str = "strategy,operations,value_bytes,key_space,persistent_every,segment_bytes,minimum_reclaim_ratio_bps,minimum_input_segments,pause_budget_ns,trial,elapsed_ns,ops_per_second,set_p50_ns,set_p95_ns,set_p99_ns,set_p999_ns,foreground_encoded_bytes,logical_write_amplification,checks,compactions,maintenance_steps,copy_slices,output_preparations,input_bytes,copied_bytes,reclaimable_bytes,actual_reclaim_ratio_bps,max_input_bytes,max_copied_bytes,planning_failures,compaction_failures,pause_budget_exceeded,max_pause_ns,retained_segment_files,retained_segment_bytes,retained_allocated_bytes,recovery_ns";
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<(), String> {
@@ -209,7 +209,7 @@ struct Row {
 impl Row {
     fn csv_line(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.strategy.name(),
             self.operations,
             self.value_bytes,
@@ -230,6 +230,9 @@ impl Row {
             self.logical_write_amplification(),
             self.maintenance.checks,
             self.maintenance.compactions,
+            self.maintenance.steps,
+            self.maintenance.copy_slices,
+            self.maintenance.output_preparations,
             self.maintenance.input_bytes,
             self.maintenance.copied_bytes,
             self.maintenance.reclaimable_bytes,
@@ -454,6 +457,12 @@ mod tests {
         };
         let row = run_case(&config, Strategy::Background, 1).expect("case");
         assert!(row.maintenance.compactions > 0);
+        assert!(row.maintenance.steps > row.maintenance.compactions);
+        assert!(row.maintenance.copy_slices <= row.maintenance.steps);
+        assert!(row.maintenance.output_preparations >= row.maintenance.compactions);
+        assert!(
+            row.maintenance.output_preparations <= row.maintenance.compactions.saturating_add(1)
+        );
         assert!(row.maintenance.reclaimable_bytes > 0);
         assert_eq!(
             row.csv_line().split(',').count(),

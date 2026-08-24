@@ -5,6 +5,10 @@
 //! Exact key equality uses the original durable key bytes. Immutable payloads
 //! receive a BLAKE3-256 artifact identity; routing hashes are not identities.
 
+mod compaction_job;
+
+pub use compaction_job::{CompactionJob, CompactionProgress, CompactionSliceBudget};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
@@ -26,7 +30,7 @@ use punah_metadata::{
 };
 use punah_record::{
     DecodeError, DecodedRecordRef, EncodeError, RECORD_HEADER_LEN, Record, RecordType,
-    committed_record_len, decode, decode_ref, encoded_len, encoded_len_for_fields,
+    committed_record_len, decode_ref, encoded_len, encoded_len_for_fields,
 };
 use punah_types::{
     ArtifactId, ContentHash, Durability, EntryState, Namespace, RecordLocation, SegmentId,
@@ -37,7 +41,6 @@ const QUEUE_CAPACITY: usize = 64;
 const MAX_COHORT_RECORDS: usize = 64;
 const MAX_COHORT_BYTES: u64 = 1024 * 1024;
 type Relocation = (Vec<u8>, u64, RecordLocation, RecordLocation);
-type CopyResult = (usize, u64, Vec<Relocation>);
 
 struct PreparedCompaction {
     generation: u32,
@@ -171,7 +174,7 @@ pub struct Store {
     io_telemetry: StoreIoTelemetry,
 }
 
-/// Outcome of one exclusive, synchronous compaction.
+/// Outcome of one successfully published compaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompactionReport {
     pub input_segments: usize,
@@ -717,41 +720,29 @@ impl Store {
         plan_compaction(&candidates, limits)
     }
 
-    /// Rewrites the latest versions located in the plan's sealed inputs, then
-    /// atomically publishes the replacement membership before deleting inputs.
-    /// Exclusive `&mut self` is the initial compaction publication barrier.
+    /// Synchronously drives the resumable compaction state machine to
+    /// completion. Background callers use [`Store::begin_compaction`] and
+    /// [`Store::advance_compaction`] so foreground work can run between copy
+    /// slices. Replacement membership is published before inputs are deleted.
     ///
     /// # Errors
     /// Returns an error for an invalid plan, corrupt input, insufficient output
     /// capacity, failed durable I/O, or failed metadata publication.
     pub fn compact(&mut self, plan: &CompactionPlan) -> Result<CompactionReport, StoreError> {
-        self.ensure_writable()?;
-        if plan.input_segments.is_empty() {
-            return Err(StoreError::InvalidCompactionPlan);
+        let mut job = self.begin_compaction(plan)?;
+        loop {
+            match self.advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)? {
+                CompactionProgress::Copying { .. } | CompactionProgress::ReadyToPublish => {}
+                CompactionProgress::Complete(report) => return Ok(report),
+            }
         }
-        if plan.required_output_bytes > self.config.segment_capacity {
-            return Err(StoreError::InvalidCompactionPlan);
-        }
-        let inputs = plan.input_segments.clone();
-        if inputs.iter().any(|input| {
-            !self.sealed_segments.iter().any(|sealed| {
-                sealed.segment_id.0 == input.id && sealed.generation == input.generation
-            })
-        }) {
-            return Err(StoreError::InvalidCompactionPlan);
-        }
+    }
 
-        let inputs_are_all_dead = !self.versions.values().any(|version| {
-            inputs.iter().any(|input| {
-                version.location.segment_id.0 == input.id
-                    && version.location.generation == input.generation
-            })
-        });
-        let mut prepared = if inputs_are_all_dead {
-            None
-        } else {
-            Some(self.prepare_compaction(&inputs)?)
-        };
+    fn finish_prepared_compaction(
+        &mut self,
+        inputs: &[SegmentRef],
+        mut prepared: Option<PreparedCompaction>,
+    ) -> Result<CompactionReport, StoreError> {
         // The replacement checkpoint also makes the current active prefix a
         // strict recovery fence. Buffered records must reach stable storage
         // before that metadata can become authoritative.
@@ -779,7 +770,7 @@ impl Store {
         let output_len = prepared
             .as_ref()
             .map_or(0, |prepared| prepared.committed_len);
-        if let Err(error) = self.publish_replacement(&inputs, output_generation, output_len) {
+        if let Err(error) = self.publish_replacement(inputs, output_generation, output_len) {
             // A failed flush/write can be observationally ambiguous: the new
             // root may already be durable. Only reopen may resolve authority.
             self.poisoned = true;
@@ -795,51 +786,12 @@ impl Store {
         } else {
             (0, 0, None)
         };
-        let removed_segments = self.retire_compaction_files(&inputs, output_path.as_deref())?;
+        let removed_segments = self.retire_compaction_files(inputs, output_path.as_deref())?;
         Ok(CompactionReport {
             input_segments: inputs.len(),
             copied_records,
             copied_bytes,
             removed_segments,
-        })
-    }
-
-    fn prepare_compaction(
-        &mut self,
-        inputs: &[SegmentRef],
-    ) -> Result<PreparedCompaction, StoreError> {
-        let generation = self.allocate_generation()?;
-        let path = segment_path(&self.config.directory, generation);
-        let device = FileDevice::create(&path, self.config.segment_capacity, QUEUE_CAPACITY)?;
-        let mut output = SegmentWriter::new(
-            device,
-            SegmentId(generation),
-            generation,
-            self.config.segment_capacity,
-        );
-        let (copied_records, copied_bytes, relocations) = self.copy_inputs(inputs, &mut output)?;
-        let sealed_sequence = relocations
-            .iter()
-            .map(|(_, sequence, _, _)| *sequence)
-            .max()
-            .unwrap_or(0);
-        let committed_len = output.reserved_boundary();
-        let device = output.into_device();
-        device.sync_all()?;
-        sync_directory(&self.config.directory)?;
-        drop(device);
-        let mapping = (committed_len > 0)
-            .then(|| MappedSegment::open(&path))
-            .transpose()?;
-        Ok(PreparedCompaction {
-            generation,
-            path,
-            committed_len,
-            sealed_sequence,
-            mapping,
-            copied_records,
-            copied_bytes,
-            relocations,
         })
     }
 
@@ -888,95 +840,6 @@ impl Store {
         }
         sync_directory(&self.config.directory)?;
         Ok(removed_segments)
-    }
-
-    fn copy_inputs(
-        &self,
-        inputs: &[SegmentRef],
-        output: &mut SegmentWriter<FileDevice>,
-    ) -> Result<CopyResult, StoreError> {
-        let mut result = (0, 0_u64, Vec::new());
-        for input in inputs {
-            let sealed = self
-                .sealed_segments
-                .iter()
-                .find(|sealed| {
-                    sealed.segment_id.0 == input.id && sealed.generation == input.generation
-                })
-                .ok_or(StoreError::InvalidCompactionPlan)?;
-            let mapping = self
-                .mapped_segments
-                .get(&input.generation)
-                .ok_or(StoreError::MissingSegment(input.generation))?;
-            let copied = self.copy_input_records(*input, sealed, mapping, output)?;
-            result.0 += copied.0;
-            result.1 = result
-                .1
-                .checked_add(copied.1)
-                .ok_or(StoreError::SegmentOverflow)?;
-            result.2.extend(copied.2);
-        }
-        Ok(result)
-    }
-
-    fn copy_input_records(
-        &self,
-        input: SegmentRef,
-        sealed: &SealedSegment,
-        mapping: &MappedSegment,
-        output: &mut SegmentWriter<FileDevice>,
-    ) -> Result<CopyResult, StoreError> {
-        let path = segment_path(&self.config.directory, input.generation);
-        let mut result = (0, 0_u64, Vec::new());
-        let mut cursor = 0_u64;
-        let end = sealed
-            .start_offset
-            .checked_add(sealed.committed_len)
-            .ok_or(StoreError::SegmentOverflow)?;
-        let mut record_bytes = Vec::new();
-        while cursor < sealed.committed_len {
-            let offset = sealed
-                .start_offset
-                .checked_add(cursor)
-                .ok_or(StoreError::SegmentOverflow)?;
-            let header = read_mapped_header(mapping, offset)?;
-            copy_mapped_record(mapping, offset, end, &header, &mut record_bytes, &path)?;
-            let decoded = decode(&record_bytes).map_err(|source| StoreError::Decode {
-                path: path.clone(),
-                source,
-            })?;
-            let old_location = RecordLocation {
-                segment_id: SegmentId(input.id),
-                generation: input.generation,
-                offset,
-                stored_len: u32::try_from(decoded.encoded_len)
-                    .map_err(|_| StoreError::SegmentOverflow)?,
-                logical_len: u32::try_from(decoded.record.payload.len())
-                    .map_err(|_| StoreError::SegmentOverflow)?,
-            };
-            if self.current_at(&decoded.record.key, decoded.record.sequence, old_location) {
-                let key = decoded.record.key.clone();
-                let sequence = decoded.record.sequence;
-                output
-                    .try_append(decoded.record, Durability::LocalDurable)
-                    .map_err(|rejected| StoreError::Append(rejected.error))?;
-                let completion = poll_append(output)?;
-                result.0 += 1;
-                result.1 = result
-                    .1
-                    .checked_add(u64::from(completion.location.stored_len))
-                    .ok_or(StoreError::SegmentOverflow)?;
-                result
-                    .2
-                    .push((key, sequence, old_location, completion.location));
-            }
-            cursor = cursor
-                .checked_add(
-                    u64::try_from(decoded.encoded_len).map_err(|_| StoreError::SegmentOverflow)?,
-                )
-                .ok_or(StoreError::SegmentOverflow)?;
-        }
-        Ok(result)
     }
 
     fn current_at(&self, key: &[u8], sequence: u64, location: RecordLocation) -> bool {
@@ -1797,15 +1660,6 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
     fs::File::open(directory)?.sync_all()
 }
 
-fn poll_append(writer: &mut SegmentWriter<FileDevice>) -> Result<AppendCompletion, StoreError> {
-    loop {
-        if let Some(result) = writer.poll() {
-            return result.map_err(StoreError::Append);
-        }
-        std::thread::yield_now();
-    }
-}
-
 fn unix_ns(time: SystemTime) -> Result<u64, StoreError> {
     let nanos = time
         .duration_since(UNIX_EPOCH)
@@ -2560,6 +2414,70 @@ mod tests {
     }
 
     #[test]
+    fn resumable_compaction_ignores_a_relocation_superseded_between_slices() {
+        let dir = TempDir::new();
+        let cfg = config(&dir.0, 320);
+        let mut store = Store::open(cfg.clone()).expect("open");
+        store.set(b"key", b"old".to_vec(), None).expect("old");
+        store
+            .set(b"filler", vec![7; 120], None)
+            .expect("rotate key segment");
+        let sealed = store.sealed_segments()[0];
+        let plan = CompactionPlan {
+            input_segments: vec![SegmentRef {
+                id: sealed.segment_id.0,
+                generation: sealed.generation,
+            }],
+            input_bytes: sealed.committed_len,
+            reclaimable_bytes: 0,
+            required_output_bytes: sealed.committed_len,
+            required_headroom_bytes: sealed.committed_len,
+        };
+        let mut job = store.begin_compaction(&plan).expect("begin");
+        let first = store
+            .advance_compaction(
+                &mut job,
+                CompactionSliceBudget {
+                    records: 1,
+                    bytes: 1,
+                },
+            )
+            .expect("first copy slice");
+        assert!(matches!(
+            first,
+            CompactionProgress::Copying {
+                examined_records: 1,
+                copied_records: 1,
+                ..
+            }
+        ));
+
+        store
+            .set(b"key", b"newer foreground value".to_vec(), None)
+            .expect("supersede copied record");
+        let report = loop {
+            match store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("advance")
+            {
+                CompactionProgress::Copying { .. } | CompactionProgress::ReadyToPublish => {}
+                CompactionProgress::Complete(report) => break report,
+            }
+        };
+        assert_eq!(report.copied_records, 1);
+        assert_eq!(
+            store.get(b"key").unwrap(),
+            Some(b"newer foreground value".to_vec())
+        );
+        drop(store);
+
+        assert_eq!(
+            Store::open(cfg).expect("reopen").get(b"key").unwrap(),
+            Some(b"newer foreground value".to_vec())
+        );
+    }
+
+    #[test]
     fn sealed_metrics_count_only_superseded_records_as_reclaimable() {
         let dir = TempDir::new();
         let mut store = Store::open(config(&dir.0, 320)).expect("open");
@@ -2699,10 +2617,27 @@ mod tests {
                 generation: segment.generation,
             })
             .collect();
-        let prepared = store.prepare_compaction(&inputs).expect("durable output");
-        assert!(prepared.path.exists());
-        let orphan_generation = prepared.generation;
-        drop(prepared);
+        let plan = CompactionPlan {
+            input_segments: inputs,
+            input_bytes: 320,
+            reclaimable_bytes: 128,
+            required_output_bytes: 320,
+            required_headroom_bytes: 320,
+        };
+        let mut job = store.begin_compaction(&plan).expect("begin");
+        loop {
+            match store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("advance")
+            {
+                CompactionProgress::Copying { .. } => {}
+                CompactionProgress::ReadyToPublish => break,
+                CompactionProgress::Complete(_) => panic!("root must not be published"),
+            }
+        }
+        let orphan_generation = job.output_generation().expect("replacement generation");
+        assert!(segment_path(&dir.0, orphan_generation).exists());
+        std::mem::forget(job); // Simulate a crash: destructors do not run.
         drop(store);
 
         let reopened = Store::open(cfg).expect("old root remains authoritative");
@@ -2714,6 +2649,34 @@ mod tests {
                 .all(|segment| segment.generation != orphan_generation)
         );
         assert!(segment_path(&dir.0, orphan_generation).exists());
+    }
+
+    #[test]
+    fn gracefully_dropped_compaction_job_removes_its_private_output() {
+        let dir = TempDir::new();
+        let mut store = Store::open(config(&dir.0, 320)).expect("open");
+        store.set(b"key", b"value".to_vec(), None).expect("set");
+        store
+            .set(b"filler", vec![7; 120], None)
+            .expect("rotate key segment");
+        let sealed = store.sealed_segments()[0];
+        let plan = CompactionPlan {
+            input_segments: vec![SegmentRef {
+                id: sealed.segment_id.0,
+                generation: sealed.generation,
+            }],
+            input_bytes: sealed.committed_len,
+            reclaimable_bytes: 0,
+            required_output_bytes: sealed.committed_len,
+            required_headroom_bytes: sealed.committed_len,
+        };
+        let job = store.begin_compaction(&plan).expect("begin");
+        let generation = job.output_generation().expect("output generation");
+        let path = segment_path(&dir.0, generation);
+        assert!(path.exists());
+        drop(job);
+        assert!(!path.exists());
+        assert_eq!(store.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]
@@ -2734,7 +2697,25 @@ mod tests {
                 generation: segment.generation,
             })
             .collect();
-        let mut prepared = store.prepare_compaction(&inputs).expect("durable output");
+        let plan = CompactionPlan {
+            input_segments: inputs.clone(),
+            input_bytes: 320,
+            reclaimable_bytes: 128,
+            required_output_bytes: 320,
+            required_headroom_bytes: 320,
+        };
+        let mut job = store.begin_compaction(&plan).expect("begin");
+        loop {
+            match store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("advance")
+            {
+                CompactionProgress::Copying { .. } => {}
+                CompactionProgress::ReadyToPublish => break,
+                CompactionProgress::Complete(_) => panic!("root published too early"),
+            }
+        }
+        let mut prepared = job.take_prepared().expect("durable output");
         store.writer.device().sync_all().expect("active prefix");
         store.sealed_segments.retain(|sealed| {
             !inputs.iter().any(|input| {
