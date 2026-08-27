@@ -16,8 +16,8 @@ const DEFAULT_MINIMUM_INPUT_SEGMENTS: usize = 2;
 /// and only while the owning shard's ingress is observed empty. Input and
 /// temporary-output bytes are hard planning bounds. Copying advances in
 /// 64-record/1-MiB slices and foreground work can preempt between them.
-/// `pause_budget` remains an observable target because durable-output setup and
-/// authority publication are indivisible synchronous steps.
+/// `pause_budget` remains an observable target for each copy/output/install
+/// step. Active-prefix and metadata durability run off-owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackgroundCompaction {
     Disabled,
@@ -198,6 +198,7 @@ struct ActiveCompaction {
     job: CompactionJob,
     input_bytes: u64,
     reclaimable_bytes: u64,
+    publishing: bool,
 }
 
 impl MaintenanceScheduler {
@@ -229,6 +230,10 @@ impl MaintenanceScheduler {
 
     pub(crate) const fn has_active_compaction(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(crate) fn publication_inflight(&self) -> bool {
+        self.active.as_ref().is_some_and(|active| active.publishing)
     }
 
     pub(crate) fn run_once(&mut self, store: &mut Store) {
@@ -303,6 +308,12 @@ impl MaintenanceScheduler {
             Ok(CompactionProgress::Copying { .. }) => {
                 self.counters.copy_slices.fetch_add(1, Ordering::Relaxed);
             }
+            Ok(CompactionProgress::Publishing) => {
+                self.active
+                    .as_mut()
+                    .expect("publishing job remains installed")
+                    .publishing = true;
+            }
             Ok(CompactionProgress::ReadyToPublish) => {
                 self.counters
                     .output_preparations
@@ -340,6 +351,7 @@ impl MaintenanceScheduler {
                 job,
                 input_bytes: plan.input_bytes,
                 reclaimable_bytes: plan.reclaimable_bytes,
+                publishing: false,
             });
             true
         } else {

@@ -6,6 +6,7 @@
 //! receive a BLAKE3-256 artifact identity; routing hashes are not identities.
 
 mod compaction_job;
+mod publication_job;
 
 pub use compaction_job::{CompactionJob, CompactionProgress, CompactionSliceBudget};
 
@@ -13,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use punah_compaction::{
@@ -41,6 +43,21 @@ const QUEUE_CAPACITY: usize = 64;
 const MAX_COHORT_RECORDS: usize = 64;
 const MAX_COHORT_BYTES: u64 = 1024 * 1024;
 type Relocation = (Vec<u8>, u64, RecordLocation, RecordLocation);
+
+struct PendingPublication {
+    id: u64,
+    layout_epoch: u64,
+    metadata_generation: u64,
+    inputs: Vec<SegmentRef>,
+    prepared: Option<PreparedCompaction>,
+    handle: JoinHandle<Result<(), StoreError>>,
+}
+
+#[cfg(test)]
+struct PublicationTestGate {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
 
 struct PreparedCompaction {
     generation: u32,
@@ -75,6 +92,7 @@ pub enum StoreError {
     SegmentOverflow,
     Metadata(PublicationError),
     InvalidCompactionPlan,
+    PublicationThreadPanicked,
     StorePoisoned,
     MissingSegment(u32),
     InvalidLocation(MappedReadError),
@@ -169,9 +187,27 @@ pub struct Store {
     sealed_segments: Vec<SealedSegment>,
     metadata_generation: u64,
     next_generation: u32,
+    layout_epoch: u64,
+    next_publication_id: u64,
+    pending_publication: Option<PendingPublication>,
+    completed_compaction: Option<(u64, CompactionReport)>,
+    #[cfg(test)]
+    publication_test_gate: Option<PublicationTestGate>,
     poisoned: bool,
     events: Option<EventPublisher>,
     io_telemetry: StoreIoTelemetry,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Some(publication_id) = self
+            .pending_publication
+            .as_ref()
+            .map(|publication| publication.id)
+        {
+            let _ = self.poll_compaction_publication(publication_id, true);
+        }
+    }
 }
 
 /// Outcome of one successfully published compaction.
@@ -364,6 +400,12 @@ impl Store {
                 .as_ref()
                 .map_or(0, |root| root.superblock.generation),
             next_generation,
+            layout_epoch: 0,
+            next_publication_id: 1,
+            pending_publication: None,
+            completed_compaction: None,
+            #[cfg(test)]
+            publication_test_gate: None,
             poisoned: false,
             events: None,
             io_telemetry: StoreIoTelemetry::default(),
@@ -733,48 +775,210 @@ impl Store {
         loop {
             match self.advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)? {
                 CompactionProgress::Copying { .. } | CompactionProgress::ReadyToPublish => {}
+                CompactionProgress::Publishing => std::thread::yield_now(),
                 CompactionProgress::Complete(report) => return Ok(report),
             }
         }
     }
 
-    fn finish_prepared_compaction(
+    fn start_compaction_publication(
+        &mut self,
+        inputs: Vec<SegmentRef>,
+        prepared: Option<PreparedCompaction>,
+    ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if self.pending_publication.is_some() || self.completed_compaction.is_some() {
+            return Err(StoreError::InvalidCompactionPlan);
+        }
+        let metadata_generation = self
+            .metadata_generation
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow)?;
+        let publication_id = self.next_publication_id;
+        self.next_publication_id = self
+            .next_publication_id
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow)?;
+        let task =
+            self.capture_compaction_publication(&inputs, prepared.as_ref(), metadata_generation)?;
+        #[cfg(test)]
+        let test_gate = self.publication_test_gate.take();
+        let handle = match std::thread::Builder::new()
+            .name("punah-compaction-publish".to_owned())
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(gate) = test_gate {
+                    let _ = gate.entered.send(());
+                    let _ = gate.release.recv();
+                }
+                task.execute()
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                cleanup_unpublished_output(prepared.as_ref(), &self.config.directory);
+                return Err(StoreError::Io(error));
+            }
+        };
+        self.pending_publication = Some(PendingPublication {
+            id: publication_id,
+            layout_epoch: self.layout_epoch,
+            metadata_generation,
+            inputs,
+            prepared,
+            handle,
+        });
+        Ok(publication_id)
+    }
+
+    fn capture_compaction_publication(
+        &self,
+        inputs: &[SegmentRef],
+        prepared: Option<&PreparedCompaction>,
+        metadata_generation: u64,
+    ) -> Result<publication_job::PublicationTask, StoreError> {
+        let mut active_segments: Vec<_> = self
+            .sealed_segments
+            .iter()
+            .filter(|sealed| {
+                !inputs.iter().any(|input| {
+                    input.id == sealed.segment_id.0 && input.generation == sealed.generation
+                })
+            })
+            .map(segment_descriptor)
+            .collect();
+        if let Some(output) = prepared
+            && output.committed_len > 0
+        {
+            active_segments.push(SegmentDescriptor {
+                id: output.generation,
+                generation: output.generation,
+                start_offset: 0,
+                logical_length: output.committed_len,
+                sealed_sequence: output.sealed_sequence,
+            });
+        }
+        let active_length = self
+            .writer
+            .reserved_boundary()
+            .checked_sub(self.active_start_offset)
+            .ok_or(StoreError::InvalidManifest)?;
+        active_segments.push(SegmentDescriptor {
+            id: self.segment_id.0,
+            generation: self.generation,
+            start_offset: self.active_start_offset,
+            logical_length: active_length,
+            sealed_sequence: 0,
+        });
+        let checkpoint = ManifestCheckpoint {
+            generation: metadata_generation,
+            active_segments,
+        };
+        let output_generation = prepared.map_or(0, |output| output.generation);
+        let output_len = prepared.map_or(0, |output| output.committed_len);
+        let operation = if output_len == 0 {
+            JournalOperation::Retire {
+                segments: inputs.to_vec(),
+            }
+        } else {
+            JournalOperation::Replace {
+                old: inputs.to_vec(),
+                new: vec![SegmentRef {
+                    id: output_generation,
+                    generation: output_generation,
+                }],
+            }
+        };
+        Ok(publication_job::PublicationTask {
+            active_path: segment_path(&self.config.directory, self.generation),
+            metadata_path: self.config.directory.join("metadata.punah"),
+            checkpoint,
+            journal: JournalEntry {
+                generation: metadata_generation,
+                operation,
+            },
+        })
+    }
+
+    fn poll_compaction_publication(
+        &mut self,
+        publication_id: u64,
+        block: bool,
+    ) -> Result<Option<CompactionReport>, StoreError> {
+        if self
+            .completed_compaction
+            .as_ref()
+            .is_some_and(|(id, _)| *id == publication_id)
+        {
+            return Ok(self.completed_compaction.take().map(|(_, report)| report));
+        }
+        let pending = self
+            .pending_publication
+            .as_ref()
+            .ok_or(StoreError::InvalidCompactionPlan)?;
+        if pending.id != publication_id {
+            return Err(StoreError::InvalidCompactionPlan);
+        }
+        if !block && !pending.handle.is_finished() {
+            return Ok(None);
+        }
+        let pending = self
+            .pending_publication
+            .take()
+            .expect("checked publication remains installed");
+        match pending.handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+            Err(_) => {
+                self.poisoned = true;
+                return Err(StoreError::PublicationThreadPanicked);
+            }
+        }
+        if self.layout_epoch != pending.layout_epoch {
+            self.poisoned = true;
+            return Err(StoreError::InvalidManifest);
+        }
+        self.metadata_generation = pending.metadata_generation;
+        let report = match self.install_published_compaction(&pending.inputs, pending.prepared) {
+            Ok(report) => report,
+            Err(error) => {
+                // Authority already names the replacement. Any failure while
+                // reconciling process-local state must remain fail-stop.
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        let Some(next_layout_epoch) = self.layout_epoch.checked_add(1) else {
+            self.poisoned = true;
+            return Err(StoreError::SequenceOverflow);
+        };
+        self.layout_epoch = next_layout_epoch;
+        Ok(Some(report))
+    }
+
+    fn install_published_compaction(
         &mut self,
         inputs: &[SegmentRef],
         mut prepared: Option<PreparedCompaction>,
     ) -> Result<CompactionReport, StoreError> {
-        // The replacement checkpoint also makes the current active prefix a
-        // strict recovery fence. Buffered records must reach stable storage
-        // before that metadata can become authoritative.
-        self.writer.device().sync_all()?;
-
         self.sealed_segments.retain(|sealed| {
             !inputs.iter().any(|input| {
                 input.id == sealed.segment_id.0 && input.generation == sealed.generation
             })
         });
-        if let Some(prepared_output) = prepared.as_mut()
-            && let Some(output_mapping) = prepared_output.mapping.take()
+        if let Some(output) = prepared.as_mut()
+            && let Some(mapping) = output.mapping.take()
         {
             self.sealed_segments.push(SealedSegment {
-                segment_id: SegmentId(prepared_output.generation),
-                generation: prepared_output.generation,
+                segment_id: SegmentId(output.generation),
+                generation: output.generation,
                 start_offset: 0,
-                committed_len: prepared_output.committed_len,
-                sealed_sequence: prepared_output.sealed_sequence,
+                committed_len: output.committed_len,
+                sealed_sequence: output.sealed_sequence,
             });
-            self.mapped_segments
-                .insert(prepared_output.generation, output_mapping);
-        }
-        let output_generation = prepared.as_ref().map_or(0, |prepared| prepared.generation);
-        let output_len = prepared
-            .as_ref()
-            .map_or(0, |prepared| prepared.committed_len);
-        if let Err(error) = self.publish_replacement(inputs, output_generation, output_len) {
-            // A failed flush/write can be observationally ambiguous: the new
-            // root may already be durable. Only reopen may resolve authority.
-            self.poisoned = true;
-            return Err(error);
+            self.mapped_segments.insert(output.generation, mapping);
         }
         let (copied_records, copied_bytes, output_path) = if let Some(prepared) = prepared {
             self.apply_relocations(prepared.relocations);
@@ -1129,6 +1333,20 @@ impl Store {
     }
 
     fn rotate(&mut self) -> Result<(), StoreError> {
+        if let Some(publication_id) = self
+            .pending_publication
+            .as_ref()
+            .map(|publication| publication.id)
+        {
+            let report = self
+                .poll_compaction_publication(publication_id, true)?
+                .ok_or(StoreError::InvalidCompactionPlan)?;
+            self.completed_compaction = Some((publication_id, report));
+        }
+        let next_layout_epoch = self
+            .layout_epoch
+            .checked_add(1)
+            .ok_or(StoreError::SequenceOverflow)?;
         // Rotation turns the old active prefix into a strict sealed range.
         // Promote Buffered/Memory bytes before publishing that range.
         self.writer.device().sync_all()?;
@@ -1165,6 +1383,7 @@ impl Store {
             self.poisoned = true;
             return Err(error);
         }
+        self.layout_epoch = next_layout_epoch;
         self.io_telemetry.rotations = self.io_telemetry.rotations.saturating_add(1);
         Ok(())
     }
@@ -1243,66 +1462,6 @@ impl Store {
             sync_directory(&self.config.directory)?;
         }
         MetadataPublisher::new(io).publish_checkpoint(&checkpoint, None)?;
-        Ok(())
-    }
-
-    fn publish_replacement(
-        &mut self,
-        inputs: &[SegmentRef],
-        output_generation: u32,
-        output_len: u64,
-    ) -> Result<(), StoreError> {
-        self.metadata_generation = self
-            .metadata_generation
-            .checked_add(1)
-            .ok_or(StoreError::SequenceOverflow)?;
-        let mut active_segments: Vec<_> = self
-            .sealed_segments
-            .iter()
-            .map(|segment| SegmentDescriptor {
-                id: segment.segment_id.0,
-                generation: segment.generation,
-                start_offset: segment.start_offset,
-                logical_length: segment.committed_len,
-                sealed_sequence: segment.sealed_sequence,
-            })
-            .collect();
-        let active_length = self
-            .writer
-            .reserved_boundary()
-            .checked_sub(self.active_start_offset)
-            .ok_or(StoreError::InvalidManifest)?;
-        active_segments.push(SegmentDescriptor {
-            id: self.segment_id.0,
-            generation: self.generation,
-            start_offset: self.active_start_offset,
-            logical_length: active_length,
-            sealed_sequence: 0,
-        });
-        let checkpoint = ManifestCheckpoint {
-            generation: self.metadata_generation,
-            active_segments,
-        };
-        let io = FileMetadataIo::open(self.config.directory.join("metadata.punah"))?;
-        let mut publisher = MetadataPublisher::new(io);
-        let operation = if output_len == 0 {
-            JournalOperation::Retire {
-                segments: inputs.to_vec(),
-            }
-        } else {
-            JournalOperation::Replace {
-                old: inputs.to_vec(),
-                new: vec![SegmentRef {
-                    id: output_generation,
-                    generation: output_generation,
-                }],
-            }
-        };
-        let pointer = publisher.append_journal(&JournalEntry {
-            generation: self.metadata_generation,
-            operation,
-        })?;
-        publisher.publish_checkpoint(&checkpoint, Some(pointer))?;
         Ok(())
     }
 }
@@ -1656,6 +1815,23 @@ fn segment_path(directory: &Path, generation: u32) -> PathBuf {
     directory.join(format!("segment-{generation:010}.punah"))
 }
 
+fn segment_descriptor(segment: &SealedSegment) -> SegmentDescriptor {
+    SegmentDescriptor {
+        id: segment.segment_id.0,
+        generation: segment.generation,
+        start_offset: segment.start_offset,
+        logical_length: segment.committed_len,
+        sealed_sequence: segment.sealed_sequence,
+    }
+}
+
+fn cleanup_unpublished_output(prepared: Option<&PreparedCompaction>, directory: &Path) {
+    if let Some(prepared) = prepared {
+        let _ = fs::remove_file(&prepared.path);
+        let _ = sync_directory(directory);
+    }
+}
+
 fn sync_directory(directory: &Path) -> io::Result<()> {
     fs::File::open(directory)?.sync_all()
 }
@@ -1675,6 +1851,7 @@ mod tests {
     use punah_record::encode;
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     struct TempDir(PathBuf);
@@ -1741,6 +1918,47 @@ mod tests {
         fs::write(&path, bytes).expect("write mapped fixture");
         let mapping = MappedSegment::open(path).expect("map fixture");
         (directory, mapping)
+    }
+
+    fn compaction_for_first_sealed(store: &mut Store) -> CompactionJob {
+        let sealed = store.sealed_segments()[0];
+        store
+            .begin_compaction(&CompactionPlan {
+                input_segments: vec![SegmentRef {
+                    id: sealed.segment_id.0,
+                    generation: sealed.generation,
+                }],
+                input_bytes: sealed.committed_len,
+                reclaimable_bytes: 0,
+                required_output_bytes: sealed.committed_len,
+                required_headroom_bytes: sealed.committed_len,
+            })
+            .expect("begin compaction")
+    }
+
+    fn advance_until_ready(store: &mut Store, job: &mut CompactionJob) {
+        loop {
+            match store
+                .advance_compaction(job, CompactionSliceBudget::DEFAULT)
+                .expect("advance compaction")
+            {
+                CompactionProgress::Copying { .. } => {}
+                CompactionProgress::ReadyToPublish => return,
+                CompactionProgress::Publishing | CompactionProgress::Complete(_) => {
+                    panic!("publication started before the ready boundary")
+                }
+            }
+        }
+    }
+
+    fn gate_next_publication(store: &mut Store) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        store.publication_test_gate = Some(PublicationTestGate {
+            entered: entered_sender,
+            release: release_receiver,
+        });
+        (entered_receiver, release_sender)
     }
 
     #[test]
@@ -2414,6 +2632,136 @@ mod tests {
     }
 
     #[test]
+    fn foreground_append_continues_while_compaction_publication_is_blocked() {
+        let dir = TempDir::new();
+        let cfg = config(&dir.0, 4096);
+        let mut store = Store::open(cfg.clone()).expect("open");
+        store.set(b"seed", b"value".to_vec(), None).expect("seed");
+        store.rotate().expect("seal seed segment");
+        let mut job = compaction_for_first_sealed(&mut store);
+        advance_until_ready(&mut store, &mut job);
+        let captured_boundary = store.writer.reserved_boundary();
+        let (entered, release) = gate_next_publication(&mut store);
+
+        assert_eq!(
+            store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("start publication"),
+            CompactionProgress::Publishing
+        );
+        entered.recv().expect("publisher reached gate");
+        store
+            .set(b"foreground", b"suffix".to_vec(), None)
+            .expect("append while metadata is blocked");
+        assert!(store.writer.reserved_boundary() > captured_boundary);
+        assert_eq!(store.get(b"foreground").unwrap(), Some(b"suffix".to_vec()));
+        release.send(()).expect("release publisher");
+
+        let report = loop {
+            match store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("poll publication")
+            {
+                CompactionProgress::Publishing => std::thread::yield_now(),
+                CompactionProgress::Complete(report) => break report,
+                CompactionProgress::Copying { .. } | CompactionProgress::ReadyToPublish => {
+                    panic!("copy cannot resume after publication starts")
+                }
+            }
+        };
+        assert_eq!(report.input_segments, 1);
+        drop(store);
+
+        let reopened = Store::open(cfg).expect("reopen");
+        assert_eq!(reopened.get(b"seed").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            reopened.get(b"foreground").unwrap(),
+            Some(b"suffix".to_vec())
+        );
+    }
+
+    #[test]
+    fn rotation_rendezvous_installs_an_inflight_publication_before_layout_change() {
+        let dir = TempDir::new();
+        let cfg = config(&dir.0, 512);
+        let mut store = Store::open(cfg.clone()).expect("open");
+        store.set(b"seed", b"value".to_vec(), None).expect("seed");
+        store.rotate().expect("seal seed segment");
+        store
+            .set(b"anchor", vec![1; 200], None)
+            .expect("fill active segment");
+        let mut job = compaction_for_first_sealed(&mut store);
+        advance_until_ready(&mut store, &mut job);
+        let (entered, release) = gate_next_publication(&mut store);
+        assert_eq!(
+            store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("start publication"),
+            CompactionProgress::Publishing
+        );
+        entered.recv().expect("publisher reached gate");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            release.send(()).expect("release publisher");
+        });
+
+        store
+            .set(b"rotation-trigger", vec![2; 200], None)
+            .expect("rotation waits for publication then appends");
+        releaser.join().expect("releaser");
+        let report = store
+            .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+            .expect("consume publication result");
+        assert!(matches!(report, CompactionProgress::Complete(_)));
+        assert!(store.io_telemetry().rotations >= 2);
+        drop(store);
+
+        let reopened = Store::open(cfg).expect("reopen");
+        assert_eq!(reopened.get(b"seed").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reopened.get(b"anchor").unwrap(), Some(vec![1; 200]));
+        assert_eq!(
+            reopened.get(b"rotation-trigger").unwrap(),
+            Some(vec![2; 200])
+        );
+    }
+
+    #[test]
+    fn publication_task_failure_fail_stops_the_store() {
+        let dir = TempDir::new();
+        let mut store = Store::open(config(&dir.0, 4096)).expect("open");
+        store.set(b"seed", b"value".to_vec(), None).expect("seed");
+        store.rotate().expect("seal seed segment");
+        let mut job = compaction_for_first_sealed(&mut store);
+        advance_until_ready(&mut store, &mut job);
+        let (entered, release) = gate_next_publication(&mut store);
+        assert_eq!(
+            store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("start publication"),
+            CompactionProgress::Publishing
+        );
+        entered.recv().expect("publisher reached gate");
+        let active_path = segment_path(&dir.0, store.generation);
+        let displaced_path = dir.0.join("displaced-active.punah");
+        fs::rename(&active_path, &displaced_path).expect("hide active path from publisher");
+        release.send(()).expect("release publisher");
+
+        let error = loop {
+            match store.advance_compaction(&mut job, CompactionSliceBudget::DEFAULT) {
+                Ok(CompactionProgress::Publishing) => std::thread::yield_now(),
+                Err(error) => break error,
+                Ok(_) => panic!("failed publication cannot complete"),
+            }
+        };
+        assert!(matches!(error, StoreError::Io(_)));
+        assert!(matches!(store.get(b"seed"), Err(StoreError::StorePoisoned)));
+        assert!(matches!(
+            store.set(b"later", b"value".to_vec(), None),
+            Err(StoreError::StorePoisoned)
+        ));
+    }
+
+    #[test]
     fn resumable_compaction_ignores_a_relocation_superseded_between_slices() {
         let dir = TempDir::new();
         let cfg = config(&dir.0, 320);
@@ -2460,7 +2808,9 @@ mod tests {
                 .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
                 .expect("advance")
             {
-                CompactionProgress::Copying { .. } | CompactionProgress::ReadyToPublish => {}
+                CompactionProgress::Copying { .. }
+                | CompactionProgress::ReadyToPublish
+                | CompactionProgress::Publishing => {}
                 CompactionProgress::Complete(report) => break report,
             }
         };
@@ -2632,6 +2982,7 @@ mod tests {
             {
                 CompactionProgress::Copying { .. } => {}
                 CompactionProgress::ReadyToPublish => break,
+                CompactionProgress::Publishing => panic!("publication started too early"),
                 CompactionProgress::Complete(_) => panic!("root must not be published"),
             }
         }
@@ -2712,34 +3063,31 @@ mod tests {
             {
                 CompactionProgress::Copying { .. } => {}
                 CompactionProgress::ReadyToPublish => break,
+                CompactionProgress::Publishing => panic!("publication started too early"),
                 CompactionProgress::Complete(_) => panic!("root published too early"),
             }
         }
-        let mut prepared = job.take_prepared().expect("durable output");
-        store.writer.device().sync_all().expect("active prefix");
-        store.sealed_segments.retain(|sealed| {
-            !inputs.iter().any(|input| {
-                input.id == sealed.segment_id.0 && input.generation == sealed.generation
-            })
-        });
-        let mapping = prepared.mapping.take().expect("nonempty output");
-        store.sealed_segments.push(SealedSegment {
-            segment_id: SegmentId(prepared.generation),
-            generation: prepared.generation,
-            start_offset: 0,
-            committed_len: prepared.committed_len,
-            sealed_sequence: prepared.sealed_sequence,
-        });
-        store.mapped_segments.insert(prepared.generation, mapping);
-        store
-            .publish_replacement(&inputs, prepared.generation, prepared.committed_len)
-            .expect("publish new authority");
-        store.apply_relocations(prepared.relocations);
+        let output_generation = job.output_generation().expect("replacement generation");
+        assert_eq!(
+            store
+                .advance_compaction(&mut job, CompactionSliceBudget::DEFAULT)
+                .expect("start publication"),
+            CompactionProgress::Publishing
+        );
+        while !store
+            .pending_publication
+            .as_ref()
+            .expect("publication remains pending")
+            .handle
+            .is_finished()
+        {
+            std::thread::yield_now();
+        }
         for input in &inputs {
             assert!(segment_path(&dir.0, input.generation).exists());
         }
-        let output_generation = prepared.generation;
-        drop(store);
+        std::mem::forget(job);
+        std::mem::forget(store); // Crash before owner install and input deletion.
 
         let reopened = Store::open(cfg).expect("recover replacement root");
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"new".to_vec()));

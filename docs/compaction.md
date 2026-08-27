@@ -8,25 +8,26 @@ region.
 
 ## Current implementation status
 
-The portable store now has a synchronous/offline executor. `Store::compact`
-accepts a planner-produced batch and holds an exclusive mutable borrow for the
-entire operation; this is the initial publication barrier. It accepts only
+The portable store has both a synchronous convenience driver and a resumable
+state machine used by shard-local background maintenance. It accepts only
 sealed inputs, copies a record only when its sequence and complete old location
-still match the latest exact-key version, and retains latest tombstones.
+still match the latest exact-key version, and retains latest tombstones. Copy
+slices and publication polls release the owner between steps; authority I/O
+runs on a helper thread after an immutable snapshot is captured.
 
 Replacement records use `LocalDurable` even when foreground durability is
 weaker. Punah then appends a durable `Replace` or `Retire` record, publishes a
 complete checkpoint through the alternating superblock root, redirects exact
 matching in-memory locations, and only then unlinks sources and syncs the
-directory. An ambiguous metadata publication failure poisons the open store;
-reopening is required to determine which valid root became durable.
+directory. An ambiguous metadata publication or install failure poisons the
+open store; reopening is required to determine which valid root became durable.
 
 Once a root exists, its manifest membership is authoritative. Filename scans
 only bootstrap an absent manifest. Unreferenced filenames affect the next
 segment ID but are never made visible, preventing both orphan resurrection and
 ID reuse. Filesystem tests cover stale versions, tombstones, rotation, restart,
 reclamation, and flushed-but-unpublished orphans. Multi-output batches, reader
-epochs, online shard barriers, and bounded orphan quarantine remain later work.
+epochs, and bounded orphan quarantine remain later work.
 
 ## Chosen metadata model
 
@@ -321,18 +322,30 @@ most 64 records and 1 MiB of input per default copy slice, durably appends the
 live subset as one cohort, and permits foreground work between slices. Exact
 `(key, sequence, old_location)` relocation checks make a copy that became stale
 between slices harmless. Durable-output readiness and root publication are
-separate states, preserving the tested orphan-output crash window. GET copies
-its payload before returning, so no mapping borrow or reader lease outlives a
-Store call; removal remains quiescent without a separate epoch system. Dropping
-a job during graceful shutdown removes and directory-syncs its private output;
-only an actual crash can leave the intentionally ignored orphan behind.
+separate states, preserving the tested orphan-output crash window.
+
+At publication readiness, Store captures the replacement membership, current
+active segment, committed prefix boundary, metadata generation, and layout
+epoch. A helper thread syncs that active file and publishes the journal and root
+from only this immutable snapshot. The owner may serve reads and append a
+contiguous suffix meanwhile: the manifest makes the captured prefix strict and
+normal active recovery scans committed suffix records beyond it. Rotation is
+the topology barrier; it joins and installs the pending publication before
+sealing the active segment or publishing another root. Any task, join, install,
+or epoch failure after publication starts fail-stops the Store because authority
+may already have changed.
+
+GET copies its payload before returning, so no mapping borrow or reader lease
+outlives a Store call; removal remains quiescent without a reader epoch system.
+Dropping a private pre-publication job removes and directory-syncs its output.
+Dropping Store during graceful shutdown joins an in-flight publisher; only an
+actual crash can leave the intentionally ignored authority-window files behind.
 
 Remaining production work is policy and acceleration rather than the original
 location-backed correctness skeleton:
 
-1. move active-file and metadata durability barriers off the foreground owner,
-   with a captured active-prefix fence and layout-epoch validation, before
-   claiming a hard publication-pause bound;
+1. move post-publication input deletion/directory sync off the owner if larger
+   segment-count sweeps show it is a material install-step cost;
 2. design a version-2 predecessor-linked topology journal if checkpoint
    benchmarks show full manifests are materially expensive; journal v1 is an
    audit tail and cannot reconstruct descriptor fences;

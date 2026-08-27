@@ -54,6 +54,12 @@ reopens to prove the exact relocation fence cannot redirect the newer version.
 Graceful job cancellation is separately checked to remove its private output,
 while the crash-window test deliberately skips destructors and retains it as an
 orphan under the old root.
+Publication interleaving tests block the helper before active-file sync, append
+a foreground suffix, release publication, and reopen to prove the captured
+prefix plus suffix scan is complete. A second test fills the active segment and
+proves rotation rendezvous installs the pending root before topology changes. A
+missing captured active path makes the helper fail and verifies the Store
+rejects all later reads and mutations rather than guessing authority.
 These real-file states complement rather than overclaim the
 two-image byte model. Injecting `CrashDevice` below the complete Store still
 requires separating filesystem namespace/metadata authority from Store's

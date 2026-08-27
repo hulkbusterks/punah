@@ -223,6 +223,28 @@ exceeded 25 ms. Copy work is therefore preemptible and no longer the
 tail-latency driver; synchronous active-file/root/directory publication is the
 measured remaining floor.
 
+### Captured-prefix asynchronous publication
+
+The publication floor was removed from the normal Store-owner path without
+letting topology race metadata. At durable-output readiness, Store captures the
+active segment's committed prefix, replacement membership, next metadata
+generation, and layout epoch. A named helper thread syncs the active file and
+publishes the journal/root from that immutable snapshot. Foreground reads and
+append-only writes continue; recovery treats later committed bytes as the
+active suffix. Rotation is deliberately the rendezvous point and joins the
+publisher before sealing or publishing another layout. Any helper, join,
+install, or epoch failure fail-stops the Store.
+
+The same command and 75%-reclaim mixed fixture produced disabled throughputs of
+120.33, 120.30, and 119.95 ops/s and background throughputs of 114.87, 115.20,
+and 113.81 ops/s (medians 120.30 and 114.87, -4.5%). Each background trial still
+reclaimed 28,560 bytes while copying 4,160. Maximum owner-step pauses were
+10.01, 9.04, and 7.86 ms, down from 28.17, 28.17, and 27.96 ms; none exceeded
+the 25 ms budget. Normal SET fsync latency still dominates the roughly 27 ms
+P99, so this result is an owner-availability improvement, not a claim that all
+request latency is below 10 ms. A 1 ms idle wait between publication polls keeps
+each cycle to eight observed maintenance steps instead of busy-spinning.
+
 ## Reproduction shapes
 
 The shared-node sweep is available directly from the checked-in harness:

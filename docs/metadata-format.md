@@ -112,9 +112,10 @@ it. The zero pointer is represented only by three zero fields.
 
 Before publishing a checkpoint, Store makes every segment boundary newly made
 strict by that checkpoint durable. Rotation syncs the old active file before
-sealing it. Compaction syncs both its replacement and the current active prefix.
-New segment files are synced and their directory entry is synced before a root
-may reference the filename.
+sealing it. Compaction syncs its replacement before readiness, then a helper
+syncs the captured current-active prefix before publishing its checkpoint. New
+segment files are synced and their directory entry is synced before a root may
+reference the filename.
 
 The implemented portable publication path preserves this order, and every
 future backend must do the same:

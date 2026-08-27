@@ -99,16 +99,17 @@ scaling changes, not a single headline number:
 | Writer LocalDurable, 64 B, singleton→mean 62.5 records/cohort | 126 ops/s | 7,945 ops/s | 62.8x via flush amortization |
 | Buffered shared node, 64 B, concurrency 16, 1→2 shards | 322.6k ops/s | 439.6k ops/s | sublinear scaling, then plateau |
 | 32 KiB verified GET, contiguous→vectored output | 126.4k ops/s | 164.2k ops/s | +29.9%; won 5/5 paired trials |
-| Partial-live compaction owner stall | ~104–107 ms whole compaction | ~28 ms max step | copy is resumable; publication is the floor |
+| Partial-live compaction owner stall | ~104–107 ms whole compaction | 7.86–10.01 ms max step | copy and authority I/O are off the owner |
 
 These are regression anchors, not Linux or kernel-bypass claims. The recovery
 path is consistent with flat cost across preallocated capacity,
 local durability amortizes two flushes across bounded cohorts, and runtime
 admission is per-shard rather than globally locked. A controlled five-trial
 server A/B validates the 32 KiB scatter/gather crossover; smaller bodies retain
-the contiguous path. Background compaction now yields between bounded copy
-slices; synchronous metadata publication remains a measured pause target rather
-than a claimed hard bound.
+the contiguous path. Background compaction yields between bounded copy slices,
+then syncs the captured active prefix and publishes metadata on a helper thread.
+Foreground appends may continue beyond that fence; a rare rotation rendezvous
+with the publication before changing segment topology.
 
 The complete decisions, trial values, caveats, and commands are preserved in
 the [August 2026 optimization log](docs/optimization-log-2026-08.md). The

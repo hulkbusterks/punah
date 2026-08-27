@@ -18,7 +18,7 @@ pub use maintenance::{BackgroundCompaction, MaintenanceSnapshot};
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -703,6 +703,15 @@ fn run_worker(
     loop {
         let request = if let Some(request) = deferred.take() {
             request
+        } else if maintenance.publication_inflight() {
+            match receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(request) => request,
+                Err(RecvTimeoutError::Timeout) => {
+                    maintenance.run_once(&mut store);
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         } else if maintenance.has_active_compaction() {
             match receiver.try_recv() {
                 Ok(request) => request,

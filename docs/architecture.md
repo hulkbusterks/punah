@@ -74,10 +74,14 @@ Active -> Sealed -> Compacting -> Retired -> Reclaimable
 ```
 
 Only an active segment accepts appends. Compaction copies live records from
-sealed segments. The current reference compactor runs synchronously under the
-Store's exclusive mutable ownership, and GET returns an owned payload, so no
-reader can retain a mapping during reclamation. A future background or direct
-mmap-to-network path must add read leases and defer retirement until they drain.
+sealed segments in bounded Store-owner slices. Once output is durable, the
+owner captures an active-prefix fence and immutable replacement manifest;
+active-file sync and metadata publication run on a helper thread. Reads and
+append-only writes continue while it runs. Segment rotation joins and installs
+the publication before changing topology, and a layout epoch rejects any
+impossible stale install. GET returns an owned payload, so no reader can retain
+a mapping during reclamation. A future direct mmap-to-network path must add read
+leases and defer retirement until they drain.
 
 The reference engine maps the pre-sized active file through a read-only handle
 while its exclusive owner writes through a separate handle. A location becomes

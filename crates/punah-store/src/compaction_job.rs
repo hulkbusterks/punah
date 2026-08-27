@@ -50,6 +50,9 @@ pub enum CompactionProgress {
     /// Output bytes and their directory entry are durable; authority still
     /// names the old inputs until a later publication step succeeds.
     ReadyToPublish,
+    /// The captured active prefix and replacement manifest are being made
+    /// durable off the Store owner. Foreground append-only work may continue.
+    Publishing,
     Complete(CompactionReport),
 }
 
@@ -71,6 +74,7 @@ pub struct CompactionJob {
     copy_complete: bool,
     output_prepared: bool,
     prepared: Option<PreparedCompaction>,
+    publication_id: Option<u64>,
     terminal: bool,
 }
 
@@ -78,11 +82,6 @@ impl CompactionJob {
     #[cfg(test)]
     pub(crate) const fn output_generation(&self) -> Option<u32> {
         self.output_generation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_prepared(&mut self) -> Option<PreparedCompaction> {
-        self.prepared.take()
     }
 }
 
@@ -119,7 +118,8 @@ impl Store {
     /// Returns an error for an invalid plan or output-file creation failure.
     pub fn begin_compaction(&mut self, plan: &CompactionPlan) -> Result<CompactionJob, StoreError> {
         self.ensure_writable()?;
-        if plan.input_segments.is_empty()
+        if self.pending_publication.is_some()
+            || plan.input_segments.is_empty()
             || plan.required_output_bytes > self.config.segment_capacity
             || plan.input_segments.iter().any(|input| {
                 !self.sealed_segments.iter().any(|sealed| {
@@ -129,6 +129,10 @@ impl Store {
         {
             return Err(StoreError::InvalidCompactionPlan);
         }
+        // A rotation may have installed a finished publication on behalf of a
+        // job its direct caller then abandoned. Starting a new single-owner job
+        // explicitly supersedes that unobserved report.
+        self.completed_compaction = None;
 
         let inputs = plan.input_segments.clone();
         let has_live_input = self.versions.values().any(|version| {
@@ -168,12 +172,13 @@ impl Store {
             copy_complete: !has_live_input,
             output_prepared: false,
             prepared: None,
+            publication_id: None,
             terminal: false,
         })
     }
 
-    /// Advances at most one bounded input-copy slice or publishes a completed
-    /// replacement. Publication remains one synchronous durability barrier.
+    /// Advances at most one bounded input-copy slice, starts publication, or
+    /// polls an in-flight publication without blocking the Store owner.
     ///
     /// # Errors
     /// Returns for invalid state, corrupt input, output I/O, or publication
@@ -188,6 +193,19 @@ impl Store {
         if job.terminal {
             return Err(StoreError::InvalidCompactionPlan);
         }
+        if let Some(publication_id) = job.publication_id {
+            return match self.poll_compaction_publication(publication_id, false) {
+                Ok(Some(report)) => {
+                    job.terminal = true;
+                    Ok(CompactionProgress::Complete(report))
+                }
+                Ok(None) => Ok(CompactionProgress::Publishing),
+                Err(error) => {
+                    job.terminal = true;
+                    Err(error)
+                }
+            };
+        }
         if job.copy_complete {
             if !job.output_prepared {
                 let result = self.prepare_compaction_output(job);
@@ -198,10 +216,16 @@ impl Store {
                 job.output_prepared = true;
                 return Ok(CompactionProgress::ReadyToPublish);
             }
-            job.terminal = true;
-            return self
-                .finish_compaction_job(job)
-                .map(CompactionProgress::Complete);
+            let publication_id =
+                match self.start_compaction_publication(job.inputs.clone(), job.prepared.take()) {
+                    Ok(publication_id) => publication_id,
+                    Err(error) => {
+                        job.terminal = true;
+                        return Err(error);
+                    }
+                };
+            job.publication_id = Some(publication_id);
+            return Ok(CompactionProgress::Publishing);
         }
 
         let result = self.copy_compaction_slice(job, budget);
@@ -395,12 +419,5 @@ impl Store {
             None
         };
         Ok(())
-    }
-
-    fn finish_compaction_job(
-        &mut self,
-        job: &mut CompactionJob,
-    ) -> Result<CompactionReport, StoreError> {
-        self.finish_prepared_compaction(&job.inputs, job.prepared.take())
     }
 }
